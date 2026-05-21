@@ -715,6 +715,11 @@ impl BatchOperationService {
         let buf_writer = BufWriter::with_capacity(256 * 1024, tokio_file);
         let mut zip = ZipFileWriter::with_tokio(buf_writer);
 
+        // Track whether any item was authorized + added to the ZIP. If
+        // none were, return NotFound — empty ZIPs are useless and mask
+        // authz failures from the client.
+        let mut items_added: usize = 0;
+
         // ── Add individual files at the root of the ZIP ──────────────────
         for file_id in &file_ids {
             match self
@@ -723,11 +728,14 @@ impl BatchOperationService {
                 .await
             {
                 Ok(file_dto) => {
-                    if let Err(e) = self
+                    match self
                         .add_file_entry_streamed(&mut zip, file_id, &file_dto.name, user_id)
                         .await
                     {
-                        info!("Could not add file {} to ZIP: {}", file_dto.name, e);
+                        Ok(_) => items_added += 1,
+                        Err(e) => {
+                            info!("Could not add file {} to ZIP: {}", file_dto.name, e);
+                        }
                     }
                 }
                 Err(e) => {
@@ -744,17 +752,28 @@ impl BatchOperationService {
                 .await
             {
                 Ok(root_folder) => {
-                    if let Err(e) = self
+                    match self
                         .add_folder_subtree_to_zip(&mut zip, folder_id, &root_folder, user_id)
                         .await
                     {
-                        info!("Could not add folder {} to ZIP: {}", root_folder.name, e);
+                        Ok(_) => items_added += 1,
+                        Err(e) => {
+                            info!("Could not add folder {} to ZIP: {}", root_folder.name, e);
+                        }
                     }
                 }
                 Err(e) => {
                     info!("Could not get folder {}: {}", folder_id, e);
                 }
             }
+        }
+
+        // Bail out before finalizing the ZIP if nothing was authorized.
+        if items_added == 0 {
+            return Err(BatchOperationError::Domain(DomainError::not_found(
+                "BatchDownload",
+                "No accessible files or folders in the request",
+            )));
         }
 
         // ── Finalize ─────────────────────────────────────────────────────

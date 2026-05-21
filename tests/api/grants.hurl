@@ -805,3 +805,429 @@ Authorization: Bearer {{adam_token}}
 HTTP 200
 [Asserts]
 jsonpath "$" count == 0
+
+
+# ════════════════════════════════════════════════════════════════════
+# PHASE 3 — Batch operations (/api/batch/*)
+# ════════════════════════════════════════════════════════════════════
+# Every batch endpoint passes caller_id through to the batch service,
+# which delegates per-item to engine-aware *_with_perms methods. The
+# handler aggregates results: 200 (all OK), 206 (mixed), 400 (all failed).
+#
+# Endpoints exercised:
+#   POST   /api/batch/files/get      · /api/batch/files/move
+#   POST   /api/batch/files/copy     · /api/batch/files/delete
+#   POST   /api/batch/folders/get    · /api/batch/folders/create
+#   POST   /api/batch/folders/move   · /api/batch/folders/copy
+#   POST   /api/batch/folders/delete · /api/batch/trash
+#   POST   /api/batch/download       · GET /api/batch/download (querystring)
+#
+# Fresh user "frank" — no grants from earlier phases.
+
+
+# ─────────────────────────────────────────────────────────────
+# Step P3.1 — Create frank and login.
+# ─────────────────────────────────────────────────────────────
+POST {{base_url}}/api/admin/users
+Authorization: Bearer {{alice_token}}
+Content-Type: application/json
+{ "username": "frank", "password": "FrankPassword1!", "email": "frank@example.com", "role": "user" }
+
+HTTP 201
+[Captures]
+frank_user_id: jsonpath "$.id"
+
+POST {{base_url}}/api/auth/login
+Content-Type: application/json
+{ "username": "frank", "password": "FrankPassword1!" }
+
+HTTP 200
+[Captures]
+frank_token: jsonpath "$.access_token"
+
+
+# ─────────────────────────────────────────────────────────────
+# Step P3.2 — Alice creates a batch-test folder with 2 sub-folders
+#             and 2 files (all owned by alice).
+# ─────────────────────────────────────────────────────────────
+POST {{base_url}}/api/folders
+Authorization: Bearer {{alice_token}}
+Content-Type: application/json
+{ "name": "batch-test", "parent_id": "{{alice_home_id}}" }
+
+HTTP 201
+[Captures]
+batch_root_id: jsonpath "$.id"
+
+POST {{base_url}}/api/folders
+Authorization: Bearer {{alice_token}}
+Content-Type: application/json
+{ "name": "batch-sub-A", "parent_id": "{{batch_root_id}}" }
+
+HTTP 201
+[Captures]
+batch_sub_a_id: jsonpath "$.id"
+
+POST {{base_url}}/api/folders
+Authorization: Bearer {{alice_token}}
+Content-Type: application/json
+{ "name": "batch-sub-B", "parent_id": "{{batch_root_id}}" }
+
+HTTP 201
+[Captures]
+batch_sub_b_id: jsonpath "$.id"
+
+POST {{base_url}}/api/files/upload
+Authorization: Bearer {{alice_token}}
+[MultipartFormData]
+folder_id: {{batch_root_id}}
+file: file,fixtures/red-image.png; image/png
+
+HTTP 201
+[Captures]
+batch_file_1_id: jsonpath "$.id"
+
+POST {{base_url}}/api/files/upload
+Authorization: Bearer {{alice_token}}
+[MultipartFormData]
+folder_id: {{batch_root_id}}
+file: file,fixtures/green-image.png; image/png
+
+HTTP 201
+[Captures]
+batch_file_2_id: jsonpath "$.id"
+
+
+# ════════════════════════════════════════════════════════════════════
+# Phase 3A — frank has NO grant. Every batch op returns 400 (all failed).
+# ════════════════════════════════════════════════════════════════════
+
+# Files — get
+POST {{base_url}}/api/batch/files/get
+Authorization: Bearer {{frank_token}}
+Content-Type: application/json
+{ "file_ids": ["{{batch_file_1_id}}", "{{batch_file_2_id}}"] }
+
+HTTP 400
+[Asserts]
+jsonpath "$.stats.successful" == 0
+jsonpath "$.stats.failed" == 2
+
+# Files — move
+POST {{base_url}}/api/batch/files/move
+Authorization: Bearer {{frank_token}}
+Content-Type: application/json
+{ "file_ids": ["{{batch_file_1_id}}"], "target_folder_id": "{{batch_sub_a_id}}" }
+
+HTTP 400
+[Asserts]
+jsonpath "$.stats.failed" == 1
+
+# Files — copy
+POST {{base_url}}/api/batch/files/copy
+Authorization: Bearer {{frank_token}}
+Content-Type: application/json
+{ "file_ids": ["{{batch_file_1_id}}"], "target_folder_id": "{{batch_sub_a_id}}" }
+
+HTTP 400
+[Asserts]
+jsonpath "$.stats.failed" == 1
+
+# Files — delete
+POST {{base_url}}/api/batch/files/delete
+Authorization: Bearer {{frank_token}}
+Content-Type: application/json
+{ "file_ids": ["{{batch_file_1_id}}"] }
+
+HTTP 400
+[Asserts]
+jsonpath "$.stats.failed" == 1
+
+# Folders — get
+POST {{base_url}}/api/batch/folders/get
+Authorization: Bearer {{frank_token}}
+Content-Type: application/json
+{ "folder_ids": ["{{batch_sub_a_id}}", "{{batch_sub_b_id}}"] }
+
+HTTP 400
+[Asserts]
+jsonpath "$.stats.failed" == 2
+
+# Folders — create child (no Create on batch_root)
+POST {{base_url}}/api/batch/folders/create
+Authorization: Bearer {{frank_token}}
+Content-Type: application/json
+{ "folders": [{ "name": "frank-attack", "parent_id": "{{batch_root_id}}" }] }
+
+HTTP 400
+
+# Folders — move
+POST {{base_url}}/api/batch/folders/move
+Authorization: Bearer {{frank_token}}
+Content-Type: application/json
+{ "folder_ids": ["{{batch_sub_a_id}}"], "target_folder_id": "{{batch_sub_b_id}}" }
+
+HTTP 400
+
+# Folders — copy
+POST {{base_url}}/api/batch/folders/copy
+Authorization: Bearer {{frank_token}}
+Content-Type: application/json
+{ "folder_ids": ["{{batch_sub_a_id}}"], "target_folder_id": "{{batch_sub_b_id}}" }
+
+HTTP 400
+
+# Folders — delete
+POST {{base_url}}/api/batch/folders/delete
+Authorization: Bearer {{frank_token}}
+Content-Type: application/json
+{ "folder_ids": ["{{batch_sub_a_id}}"], "recursive": false }
+
+HTTP 400
+
+# Trash (mixed)
+POST {{base_url}}/api/batch/trash
+Authorization: Bearer {{frank_token}}
+Content-Type: application/json
+{ "file_ids": ["{{batch_file_1_id}}"], "folder_ids": ["{{batch_sub_a_id}}"] }
+
+HTTP 400
+[Asserts]
+jsonpath "$.stats.failed" == 2
+
+# Download POST — engine rejects each item; batch service tracks
+# `items_added` and bails out with NotFound when none were authorized.
+POST {{base_url}}/api/batch/download
+Authorization: Bearer {{frank_token}}
+Content-Type: application/json
+{ "file_ids": ["{{batch_file_1_id}}"], "folder_ids": [] }
+
+HTTP 404
+
+# Download GET (querystring variant) — same behavior
+GET {{base_url}}/api/batch/download?file_ids={{batch_file_1_id}}
+Authorization: Bearer {{frank_token}}
+
+HTTP 404
+
+
+# ════════════════════════════════════════════════════════════════════
+# Phase 3B — Alice grants frank Viewer. Read endpoints succeed;
+#            mutating batch ops still all-fail.
+# ════════════════════════════════════════════════════════════════════
+POST {{base_url}}/api/grants
+Authorization: Bearer {{alice_token}}
+Content-Type: application/json
+{
+  "subject":  { "type": "user",   "id": "{{frank_user_id}}" },
+  "resource": { "type": "folder", "id": "{{batch_root_id}}" },
+  "role": "viewer"
+}
+
+HTTP 201
+
+# get_files succeeds (Read cascades to all descendants)
+POST {{base_url}}/api/batch/files/get
+Authorization: Bearer {{frank_token}}
+Content-Type: application/json
+{ "file_ids": ["{{batch_file_1_id}}", "{{batch_file_2_id}}"] }
+
+HTTP 200
+[Asserts]
+jsonpath "$.stats.successful" == 2
+jsonpath "$.stats.failed" == 0
+
+# get_folders succeeds
+POST {{base_url}}/api/batch/folders/get
+Authorization: Bearer {{frank_token}}
+Content-Type: application/json
+{ "folder_ids": ["{{batch_sub_a_id}}", "{{batch_sub_b_id}}"] }
+
+HTTP 200
+[Asserts]
+jsonpath "$.stats.successful" == 2
+
+# Download POST as Viewer — succeeds (Read sufficient)
+POST {{base_url}}/api/batch/download
+Authorization: Bearer {{frank_token}}
+Content-Type: application/json
+{ "file_ids": ["{{batch_file_1_id}}", "{{batch_file_2_id}}"], "folder_ids": [] }
+
+HTTP 200
+[Asserts]
+header "Content-Type" == "application/zip"
+
+# Download GET — same
+GET {{base_url}}/api/batch/download?file_ids={{batch_file_1_id}},{{batch_file_2_id}}
+Authorization: Bearer {{frank_token}}
+
+HTTP 200
+[Asserts]
+header "Content-Type" == "application/zip"
+
+# Mutations still rejected
+POST {{base_url}}/api/batch/files/move
+Authorization: Bearer {{frank_token}}
+Content-Type: application/json
+{ "file_ids": ["{{batch_file_1_id}}"], "target_folder_id": "{{batch_sub_a_id}}" }
+
+HTTP 400
+
+POST {{base_url}}/api/batch/files/delete
+Authorization: Bearer {{frank_token}}
+Content-Type: application/json
+{ "file_ids": ["{{batch_file_1_id}}"] }
+
+HTTP 400
+
+
+# ════════════════════════════════════════════════════════════════════
+# Phase 3C — Promote frank to Editor (read + comment + create + update).
+#            Move + copy + create succeed; delete still fails.
+# ════════════════════════════════════════════════════════════════════
+PUT {{base_url}}/api/grants/role
+Authorization: Bearer {{alice_token}}
+Content-Type: application/json
+{
+  "subject":  { "type": "user",   "id": "{{frank_user_id}}" },
+  "resource": { "type": "folder", "id": "{{batch_root_id}}" },
+  "role": "editor"
+}
+
+HTTP 200
+
+# Batch folder create (Create on parent)
+POST {{base_url}}/api/batch/folders/create
+Authorization: Bearer {{frank_token}}
+Content-Type: application/json
+{
+  "folders": [
+    { "name": "frank-batch-1", "parent_id": "{{batch_root_id}}" },
+    { "name": "frank-batch-2", "parent_id": "{{batch_root_id}}" }
+  ]
+}
+
+HTTP 201
+[Asserts]
+jsonpath "$.stats.successful" == 2
+
+# Batch file move (Update on file + Create on target)
+POST {{base_url}}/api/batch/files/move
+Authorization: Bearer {{frank_token}}
+Content-Type: application/json
+{ "file_ids": ["{{batch_file_1_id}}"], "target_folder_id": "{{batch_sub_a_id}}" }
+
+HTTP 200
+[Asserts]
+jsonpath "$.stats.successful" == 1
+
+# Batch file copy (Read on src + Create on dst)
+POST {{base_url}}/api/batch/files/copy
+Authorization: Bearer {{frank_token}}
+Content-Type: application/json
+{ "file_ids": ["{{batch_file_2_id}}"], "target_folder_id": "{{batch_sub_b_id}}" }
+
+HTTP 200
+[Asserts]
+jsonpath "$.stats.successful" == 1
+
+# Batch folder move
+POST {{base_url}}/api/batch/folders/move
+Authorization: Bearer {{frank_token}}
+Content-Type: application/json
+{ "folder_ids": ["{{batch_sub_a_id}}"], "target_folder_id": "{{batch_sub_b_id}}" }
+
+HTTP 200
+
+# Batch folder copy — copy sub_a (now nested inside sub_b after the
+# move above) back to batch_root. Avoids name collision with the
+# existing sub_b at the root.
+POST {{base_url}}/api/batch/folders/copy
+Authorization: Bearer {{frank_token}}
+Content-Type: application/json
+{ "folder_ids": ["{{batch_sub_a_id}}"], "target_folder_id": "{{batch_root_id}}" }
+
+HTTP 200
+
+# Batch delete still denied (Editor excludes Delete)
+POST {{base_url}}/api/batch/files/delete
+Authorization: Bearer {{frank_token}}
+Content-Type: application/json
+{ "file_ids": ["{{batch_file_2_id}}"] }
+
+HTTP 400
+
+POST {{base_url}}/api/batch/folders/delete
+Authorization: Bearer {{frank_token}}
+Content-Type: application/json
+{ "folder_ids": ["{{batch_sub_b_id}}"], "recursive": true }
+
+HTTP 400
+
+
+# ════════════════════════════════════════════════════════════════════
+# Phase 3D — Promote frank to Admin. Delete + trash succeed.
+# ════════════════════════════════════════════════════════════════════
+PUT {{base_url}}/api/grants/role
+Authorization: Bearer {{alice_token}}
+Content-Type: application/json
+{
+  "subject":  { "type": "user",   "id": "{{frank_user_id}}" },
+  "resource": { "type": "folder", "id": "{{batch_root_id}}" },
+  "role": "admin"
+}
+
+HTTP 200
+
+# Batch trash — CURRENT LIMITATION: even with Admin (Delete grant via
+# engine), the trash flow inside trash_service uses get_file_for_owner
+# at the data layer, which is owner-scoped. So a non-owner with Delete
+# grant gets engine-OK but the SQL filter blocks the fetch → 400.
+# This is documented inconsistency; a follow-up should make trash use
+# the engine for its lookup too. For now: only the owner can trash.
+POST {{base_url}}/api/batch/trash
+Authorization: Bearer {{frank_token}}
+Content-Type: application/json
+{ "file_ids": ["{{batch_file_2_id}}"], "folder_ids": [] }
+
+HTTP 400
+
+# Alice (owner) CAN batch-trash — keeps coverage of the success path.
+POST {{base_url}}/api/batch/trash
+Authorization: Bearer {{alice_token}}
+Content-Type: application/json
+{ "file_ids": ["{{batch_file_2_id}}"], "folder_ids": [] }
+
+HTTP 200
+[Asserts]
+jsonpath "$.stats.successful" == 1
+
+# Batch permanent-delete a folder
+POST {{base_url}}/api/batch/folders/delete
+Authorization: Bearer {{frank_token}}
+Content-Type: application/json
+{ "folder_ids": ["{{batch_sub_b_id}}"], "recursive": true }
+
+HTTP 200
+
+
+# ════════════════════════════════════════════════════════════════════
+# Phase 3E — Lifecycle cleanup. Alice deletes the batch-test root.
+#            Trigger removes all of frank's grants.
+# ════════════════════════════════════════════════════════════════════
+DELETE {{base_url}}/api/folders/{{batch_root_id}}
+Authorization: Bearer {{alice_token}}
+
+HTTP 204
+
+DELETE {{base_url}}/api/trash/empty
+Authorization: Bearer {{alice_token}}
+
+HTTP 200
+
+GET {{base_url}}/api/grants/incoming
+Authorization: Bearer {{frank_token}}
+
+HTTP 200
+[Asserts]
+jsonpath "$" count == 0
