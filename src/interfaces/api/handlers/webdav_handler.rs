@@ -22,7 +22,7 @@ use crate::application::dtos::file_dto::FileDto;
 use crate::application::dtos::folder_dto::FolderDto;
 use crate::application::ports::file_ports::FileRetrievalUseCase;
 use crate::application::ports::file_ports::{FileManagementUseCase, FileUploadUseCase};
-use crate::application::ports::inbound::FolderUseCase;
+use crate::application::ports::folder_ports::FolderUseCase;
 use crate::application::ports::storage_ports::StorageUsagePort;
 use crate::application::services::file_retrieval_service::FileRetrievalService;
 use crate::application::services::folder_service::FolderService;
@@ -189,7 +189,7 @@ async fn handle_webdav_methods(
 async fn resolve_webdav_path(state: &Arc<AppState>, user_id: Uuid, path: &str) -> Option<String> {
     let folder_service = &state.applications.folder_service;
     let home_folders = folder_service
-        .list_folders_for_owner(None, user_id)
+        .list_folders_with_perms(None, user_id)
         .await
         .ok()?;
     let home = home_folders.first()?;
@@ -514,7 +514,7 @@ async fn build_streaming_propfind_response(
                     page_size: pagination.page_size,
                 };
                 let result = folder_service
-                    .list_folders_for_owner_paginated(fid_ref, user_id, &pag)
+                    .list_folders_paginated_with_perms(fid_ref, user_id, &pag)
                     .await
                     .map_err(|e| std::io::Error::other(e.to_string()))?;
 
@@ -544,7 +544,7 @@ async fn build_streaming_propfind_response(
             let mut offset: i64 = 0;
             loop {
                 let batch: Vec<FileDto> = file_retrieval_service
-                    .list_files_batch_for_owner(fid_ref, user_id, offset, PROPFIND_BATCH_SIZE)
+                    .list_files_batch_with_perms(fid_ref, user_id, offset, PROPFIND_BATCH_SIZE)
                     .await
                     .map_err(|e| std::io::Error::other(e.to_string()))?;
 
@@ -999,6 +999,7 @@ async fn handle_mkcol(
     req: Request<Body>,
     path: String,
 ) -> Result<Response<Body>, AppError> {
+    let user = extract_user(&req)?;
     let folder_service = &state.applications.folder_service;
 
     if path.is_empty() || path == "/" {
@@ -1041,15 +1042,13 @@ async fn handle_mkcol(
                     name: segment.to_string(),
                     parent_id: parent_id.clone(),
                 };
+                // Propagate DomainError -> AppError so NotFound/Conflict map to
+                // their proper HTTP status codes (was: blanket 500 swallowed
+                // ownership-rejection NotFound from verify_owner).
                 let created = folder_service
-                    .create_folder(create_dto)
+                    .create_folder_with_perms(create_dto, user.id)
                     .await
-                    .map_err(|e| {
-                        AppError::internal_error(format!(
-                            "Failed to create folder '{}': {}",
-                            accumulated_path, e
-                        ))
-                    })?;
+                    .map_err(AppError::from)?;
                 parent_id = Some(created.id);
             }
         }
@@ -1093,7 +1092,7 @@ async fn handle_delete(
         match resolver.resolve_path_for_user(&path, user.id).await {
             Ok(ResolvedResource::Folder(folder)) => {
                 folder_service
-                    .delete_folder(&folder.id, user.id)
+                    .delete_folder_with_perms(&folder.id, user.id)
                     .await
                     .map_err(|e| {
                         AppError::internal_error(format!("Failed to delete folder: {}", e))
@@ -1101,7 +1100,7 @@ async fn handle_delete(
             }
             Ok(ResolvedResource::File(file)) => {
                 file_management_service
-                    .delete_file(&file.id)
+                    .delete_file_with_perms(&file.id, user.id)
                     .await
                     .map_err(|e| {
                         AppError::internal_error(format!("Failed to delete file: {}", e))
@@ -1116,7 +1115,7 @@ async fn handle_delete(
         if let Ok(folder) = folder_result {
             assert_owner(folder.owner_id.as_deref(), &user.id.to_string(), &path)?;
             folder_service
-                .delete_folder(&folder.id, user.id)
+                .delete_folder_with_perms(&folder.id, user.id)
                 .await
                 .map_err(|e| AppError::internal_error(format!("Failed to delete folder: {}", e)))?;
         } else {
@@ -1127,7 +1126,7 @@ async fn handle_delete(
             assert_owner(file.owner_id.as_deref(), &user.id.to_string(), &path)?;
 
             file_management_service
-                .delete_file(&file.id)
+                .delete_file_with_perms(&file.id, user.id)
                 .await
                 .map_err(|e| AppError::internal_error(format!("Failed to delete file: {}", e)))?;
         }
@@ -1249,7 +1248,7 @@ async fn handle_move(
                 };
 
                 folder_service
-                    .move_folder(&folder.id, move_dto, user.id)
+                    .move_folder_with_perms(&folder.id, move_dto, user.id)
                     .await
                     .map_err(AppError::from)?;
 
@@ -1258,7 +1257,7 @@ async fn handle_move(
                         name: dest_folder_name.to_string(),
                     };
                     folder_service
-                        .rename_folder(&folder.id, rename_dto, user.id)
+                        .rename_folder_with_perms(&folder.id, rename_dto, user.id)
                         .await
                         .map_err(AppError::from)?;
                 }
@@ -1292,13 +1291,13 @@ async fn handle_move(
                         )?;
                     }
                     file_management_service
-                        .move_file(&file.id, Some(dest_parent_path.to_string()))
+                        .move_file_with_perms(&file.id, user.id, Some(dest_parent_path.to_string()))
                         .await
                         .map_err(AppError::from)?;
                 }
                 if file.name != dest_filename {
                     file_management_service
-                        .rename_file(&file.id, dest_filename)
+                        .rename_file_with_perms(&file.id, user.id, dest_filename)
                         .await
                         .map_err(AppError::from)?;
                 }
@@ -1350,7 +1349,7 @@ async fn handle_move(
             };
 
             folder_service
-                .move_folder(&folder.id, move_dto, user.id)
+                .move_folder_with_perms(&folder.id, move_dto, user.id)
                 .await
                 .map_err(|e| AppError::internal_error(format!("Failed to move folder: {}", e)))?;
 
@@ -1359,7 +1358,7 @@ async fn handle_move(
                     name: dest_folder_name.to_string(),
                 };
                 folder_service
-                    .rename_folder(&folder.id, rename_dto, user.id)
+                    .rename_folder_with_perms(&folder.id, rename_dto, user.id)
                     .await
                     .map_err(AppError::from)?;
             }
@@ -1399,13 +1398,13 @@ async fn handle_move(
                     )?;
                 }
                 file_management_service
-                    .move_file(&file.id, Some(dest_parent_path.to_string()))
+                    .move_file_with_perms(&file.id, user.id, Some(dest_parent_path.to_string()))
                     .await
                     .map_err(AppError::from)?;
             }
             if file.name != dest_filename {
                 file_management_service
-                    .rename_file(&file.id, dest_filename)
+                    .rename_file_with_perms(&file.id, user.id, dest_filename)
                     .await
                     .map_err(AppError::from)?;
             }
@@ -1536,8 +1535,9 @@ async fn handle_copy(
                 if recursive {
                     let file_management_service = &state.applications.file_management_service;
                     file_management_service
-                        .copy_folder_tree(
+                        .copy_folder_tree_with_perms(
                             &folder.id,
+                            user.id,
                             target_parent_id,
                             Some(dest_folder_name.to_string()),
                         )
@@ -1551,7 +1551,7 @@ async fn handle_copy(
                         parent_id: target_parent_id,
                     };
                     folder_service
-                        .create_folder(create_dto)
+                        .create_folder_with_perms(create_dto, user.id)
                         .await
                         .map_err(|e| {
                             AppError::internal_error(format!(
@@ -1587,7 +1587,7 @@ async fn handle_copy(
 
                 let file_management_service = &state.applications.file_management_service;
                 file_management_service
-                    .copy_file(&file.id, target_folder_id)
+                    .copy_file_with_perms(&file.id, user.id, target_folder_id)
                     .await
                     .map_err(|e| AppError::internal_error(format!("Failed to copy file: {}", e)))?;
             }
@@ -1640,8 +1640,9 @@ async fn handle_copy(
             if recursive {
                 let file_management_service = &state.applications.file_management_service;
                 file_management_service
-                    .copy_folder_tree(
+                    .copy_folder_tree_with_perms(
                         &folder.id,
+                        user.id,
                         target_parent_id,
                         Some(dest_folder_name.to_string()),
                     )
@@ -1655,7 +1656,7 @@ async fn handle_copy(
                     parent_id: target_parent_id,
                 };
                 folder_service
-                    .create_folder(create_dto)
+                    .create_folder_with_perms(create_dto, user.id)
                     .await
                     .map_err(|e| {
                         AppError::internal_error(format!(
@@ -1698,7 +1699,7 @@ async fn handle_copy(
 
             let file_management_service = &state.applications.file_management_service;
             file_management_service
-                .copy_file(&file.id, target_folder_id)
+                .copy_file_with_perms(&file.id, user.id, target_folder_id)
                 .await
                 .map_err(|e| AppError::internal_error(format!("Failed to copy file: {}", e)))?;
         }
