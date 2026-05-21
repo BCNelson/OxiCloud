@@ -189,7 +189,7 @@ async fn handle_webdav_methods(
 async fn resolve_webdav_path(state: &Arc<AppState>, user_id: Uuid, path: &str) -> Option<String> {
     let folder_service = &state.applications.folder_service;
     let home_folders = folder_service
-        .list_folders_for_owner(None, user_id)
+        .list_folders_with_perms(None, user_id)
         .await
         .ok()?;
     let home = home_folders.first()?;
@@ -514,7 +514,7 @@ async fn build_streaming_propfind_response(
                     page_size: pagination.page_size,
                 };
                 let result = folder_service
-                    .list_folders_for_owner_paginated(fid_ref, user_id, &pag)
+                    .list_folders_paginated_with_perms(fid_ref, user_id, &pag)
                     .await
                     .map_err(|e| std::io::Error::other(e.to_string()))?;
 
@@ -544,7 +544,7 @@ async fn build_streaming_propfind_response(
             let mut offset: i64 = 0;
             loop {
                 let batch: Vec<FileDto> = file_retrieval_service
-                    .list_files_batch_for_owner(fid_ref, user_id, offset, PROPFIND_BATCH_SIZE)
+                    .list_files_batch_with_perms(fid_ref, user_id, offset, PROPFIND_BATCH_SIZE)
                     .await
                     .map_err(|e| std::io::Error::other(e.to_string()))?;
 

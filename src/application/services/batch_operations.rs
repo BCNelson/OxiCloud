@@ -330,7 +330,7 @@ impl BatchOperationService {
             let retrieval = self.file_retrieval.clone();
 
             async move {
-                let get_result = retrieval.get_file_owned(&file_id, user_id).await;
+                let get_result = retrieval.get_file_with_perms(&file_id, user_id).await;
                 (file_id, get_result)
             }
         }))
@@ -717,7 +717,11 @@ impl BatchOperationService {
 
         // ── Add individual files at the root of the ZIP ──────────────────
         for file_id in &file_ids {
-            match self.file_retrieval.get_file_owned(file_id, user_id).await {
+            match self
+                .file_retrieval
+                .get_file_with_perms(file_id, user_id)
+                .await
+            {
                 Ok(file_dto) => {
                     if let Err(e) = self
                         .add_file_entry_streamed(&mut zip, file_id, &file_dto.name, user_id)
@@ -790,7 +794,7 @@ impl BatchOperationService {
 
         let stream = self
             .file_retrieval
-            .get_file_stream_owned(file_id, caller_id)
+            .get_file_stream_with_perms(file_id, caller_id)
             .await
             .map_err(BatchOperationError::Domain)?;
         let mut stream = std::pin::Pin::from(stream);

@@ -38,6 +38,7 @@ use crate::infrastructure::services::file_content_cache::{
 use crate::infrastructure::services::file_system_i18n_service::FileSystemI18nService;
 use crate::infrastructure::services::nextcloud_chunked_upload_service::NextcloudChunkedUploadService;
 use crate::infrastructure::services::path_service::PathService;
+use crate::infrastructure::services::pg_acl_engine::PgAclEngine;
 use crate::infrastructure::services::trash_cleanup_service::TrashCleanupService;
 
 use crate::application::services::app_password_service::AppPasswordService;
@@ -350,7 +351,7 @@ impl AppServiceFactory {
         repos: &RepositoryServices,
         trash_service: Option<Arc<TrashService>>,
         db_pool: &Arc<PgPool>,
-        authz: &Arc<crate::infrastructure::services::pg_acl_engine::PgAclEngine>,
+        authz: &Arc<PgAclEngine>,
     ) -> ApplicationServices {
         // Main services
         let folder_service = Arc::new(FolderService::new(
@@ -452,6 +453,7 @@ impl AppServiceFactory {
         &self,
         repos: &RepositoryServices,
         core: &CoreServices,
+        authz: &Arc<PgAclEngine>,
     ) -> Option<Arc<TrashService>> {
         if !self.config.features.enable_trash {
             tracing::info!("Trash service is disabled in configuration");
@@ -470,6 +472,7 @@ impl AppServiceFactory {
             core.dedup_service.clone(),
             Some(core.thumbnail_service.clone()),
             Some(core.file_content_cache.clone()),
+            authz.clone(),
         ));
 
         // Initialize cleanup service (bulk-deletes expired items in 2 SQL queries)
@@ -609,16 +612,18 @@ impl AppServiceFactory {
         // 2. Repository services (requires PgPool for all metadata)
         let repos = self.create_repository_services(&core, &pool);
 
-        // 3. Trash service (needed before application services)
-        let trash_service = self.create_trash_service(&repos, &core).await;
-
-        // 3b. Authorization engine — must exist before application services
+        // 3a. Authorization engine — must exist before application services
         // because services hold an Arc<PgAclEngine> for ReBAC checks.
         let authorization = build_authorization_engine(
             pool.clone(),
             repos.folder_repository.clone(),
             repos.file_read_repository.clone(),
         );
+
+        // 3b. Trash service (needed before application services)
+        let trash_service = self
+            .create_trash_service(&repos, &core, &authorization)
+            .await;
 
         // 4. Application services (with trash + authz already wired)
         let mut apps = self.create_application_services(

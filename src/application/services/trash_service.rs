@@ -6,18 +6,21 @@ use crate::application::dtos::display_helpers::{
     category_for, icon_class_for, icon_special_class_for,
 };
 use crate::application::dtos::trash_dto::TrashedItemDto;
+use crate::application::ports::authorization_ports::AuthorizationEngine;
 use crate::application::ports::storage_ports::{FileReadPort, FileWritePort};
 use crate::application::ports::trash_ports::TrashUseCase;
 use crate::common::errors::{DomainError, ErrorKind, Result};
 use crate::domain::entities::trashed_item::{TrashedItem, TrashedItemType};
 use crate::domain::repositories::folder_repository::FolderRepository;
 use crate::domain::repositories::trash_repository::TrashRepository;
+use crate::domain::services::authorization::{Permission, Resource, Subject};
 use crate::infrastructure::repositories::pg::file_blob_read_repository::FileBlobReadRepository;
 use crate::infrastructure::repositories::pg::file_blob_write_repository::FileBlobWriteRepository;
 use crate::infrastructure::repositories::pg::folder_db_repository::FolderDbRepository;
 use crate::infrastructure::repositories::pg::trash_db_repository::TrashDbRepository;
 use crate::infrastructure::services::dedup_service::DedupService;
 use crate::infrastructure::services::file_content_cache::FileContentCache;
+use crate::infrastructure::services::pg_acl_engine::PgAclEngine;
 use crate::infrastructure::services::thumbnail_service::ThumbnailService;
 
 /**
@@ -56,6 +59,9 @@ pub struct TrashService {
     /// Content cache — invalidated when files are permanently deleted from trash.
     content_cache: Option<Arc<FileContentCache>>,
 
+    /// Authz engine
+    authz: Arc<PgAclEngine>,
+
     /// Number of days items should be kept in trash before automatic cleanup
     retention_days: u32,
 }
@@ -71,6 +77,7 @@ impl TrashService {
         dedup_service: Arc<DedupService>,
         thumbnail_service: Option<Arc<ThumbnailService>>,
         content_cache: Option<Arc<FileContentCache>>,
+        authz: Arc<PgAclEngine>,
     ) -> Self {
         Self {
             trash_repository,
@@ -80,6 +87,7 @@ impl TrashService {
             dedup_service,
             thumbnail_service,
             content_cache,
+            authz,
             retention_days,
         }
     }
@@ -176,6 +184,7 @@ impl TrashUseCase for TrashService {
         Ok(dtos)
     }
 
+    // TODO: change item_type into Resource enum
     #[instrument(skip(self))]
     async fn move_to_trash(&self, item_id: &str, item_type: &str, user_id: Uuid) -> Result<()> {
         info!(
@@ -209,10 +218,23 @@ impl TrashUseCase for TrashService {
             "file" => {
                 info!("Processing file to move to trash: {}", item_id);
 
+                // XXX: right now only owner can move to trash, need to improve
+
                 // Get the file — ownership-verified at SQL level.
                 // Returns NotFound if the file does not exist OR belongs to
                 // another user, preventing cross-user trash operations.
                 debug!("Getting file data (owner-scoped): {}", item_id);
+
+                let file_id = Uuid::parse_str(item_id)
+                    .map_err(|_| DomainError::not_found("File", item_id))?;
+                self.authz
+                    .require(
+                        Subject::User(user_id),
+                        Permission::Delete,
+                        Resource::File(file_id),
+                    )
+                    .await?;
+
                 let file = match self
                     .file_read_port
                     .get_file_for_owner(item_id, user_id)
@@ -236,6 +258,7 @@ impl TrashUseCase for TrashService {
                 debug!("Original file path: {}", original_path);
 
                 // Create the trash item
+                // FIXME: item will be created with user_id that mat not be the owner_id
                 debug!("Creating TrashedItem object for the file");
                 let trashed_item = TrashedItem::new(
                     item_uuid,
@@ -286,6 +309,17 @@ impl TrashUseCase for TrashService {
                 Ok(())
             }
             "folder" => {
+                // check deletion permition
+                let folder_id = Uuid::parse_str(item_id)
+                    .map_err(|_| DomainError::not_found("Folder", item_id))?;
+                self.authz
+                    .require(
+                        Subject::User(user_id),
+                        Permission::Delete,
+                        Resource::Folder(folder_id),
+                    )
+                    .await?;
+
                 // Get the folder and verify ownership.
                 // Returns NotFound if the folder does not exist or belongs
                 // to another user — prevents cross-user trash operations.
@@ -301,18 +335,10 @@ impl TrashUseCase for TrashService {
                         )
                     })?;
 
-                // Ownership check — return NotFound (not Forbidden) to
-                // prevent leaking whether the folder exists.
-                if folder.owner_id() != Some(user_id) {
-                    return Err(DomainError::not_found(
-                        "Folder",
-                        format!("Folder not found: {}", item_id),
-                    ));
-                }
-
                 let original_path = folder.storage_path().to_string();
 
                 // Create the trash item
+                // FIXME: item will be created with user_id that mat not be the owner_id
                 let trashed_item = TrashedItem::new(
                     item_uuid,
                     user_uuid,

@@ -51,7 +51,7 @@ impl FolderHandler {
                 "create_folder: parent_id is None for user '{}', resolving home folder",
                 auth_user.username
             );
-            match service.list_folders_for_owner(None, auth_user.id).await {
+            match service.list_folders_with_perms(None, auth_user.id).await {
                 Ok(folders) => {
                     if let Some(home) = folders.first() {
                         tracing::info!(
@@ -89,22 +89,8 @@ impl FolderHandler {
         auth_user: AuthUser,
         Path(id): Path<String>,
     ) -> impl IntoResponse {
-        match service.get_folder(&id).await {
-            Ok(folder) => {
-                // Access check: folder must belong to the requesting user
-                if let Some(ref owner) = folder.owner_id
-                    && owner != &auth_user.id.to_string()
-                {
-                    tracing::warn!(
-                        "get_folder: user '{}' attempted to access folder '{}' owned by '{}'",
-                        auth_user.id,
-                        id,
-                        owner
-                    );
-                    return AppError::not_found("Folder not found").into_response();
-                }
-                (StatusCode::OK, Json(folder)).into_response()
-            }
+        match service.get_folder_with_perms(&id, auth_user.id).await {
+            Ok(folder) => (StatusCode::OK, Json(folder)).into_response(),
             Err(err) => AppError::from(err).into_response(),
         }
     }
@@ -146,7 +132,7 @@ impl FolderHandler {
         pagination: Query<PaginationRequestDto>,
     ) -> axum::response::Response {
         match service
-            .list_folders_for_owner_paginated(Some(&id), auth_user.id, &pagination)
+            .list_folders_paginated_with_perms(Some(&id), auth_user.id, &pagination)
             .await
         {
             Ok(paginated_result) => (StatusCode::OK, Json(paginated_result)).into_response(),
@@ -163,7 +149,7 @@ impl FolderHandler {
         auth_user: &AuthUser,
     ) -> axum::response::Response {
         match service
-            .list_folders_for_owner(parent_id, auth_user.id)
+            .list_folders_with_perms(parent_id, auth_user.id)
             .await
         {
             Ok(folders) => (StatusCode::OK, Json(folders)).into_response(),
@@ -206,8 +192,8 @@ impl FolderHandler {
 
         // Run both queries concurrently — no sequential wait.
         let (folders_result, files_result) = tokio::join!(
-            folder_service.list_folders_for_owner(Some(&id), auth_user.id),
-            file_service.list_files_owned(Some(&id), auth_user.id)
+            folder_service.list_folders_with_perms(Some(&id), auth_user.id),
+            file_service.list_files_with_perms(Some(&id), auth_user.id)
         );
 
         match (folders_result, files_result) {
@@ -226,7 +212,6 @@ impl FolderHandler {
                         .unwrap()
                         .into_response();
                 }
-
                 let listing = FolderListingDto { folders, files };
                 let mut resp = (StatusCode::OK, Json(listing)).into_response();
                 resp.headers_mut()
@@ -286,6 +271,7 @@ impl FolderHandler {
     ) -> impl IntoResponse {
         let user_id = auth_user.id;
         // Check if trash service is available
+        // FIXME: permissions !!
         if let Some(trash_service) = &state.trash_service {
             tracing::info!("Moving folder to trash: {}", id);
 
@@ -328,22 +314,11 @@ impl FolderHandler {
         // Get folder information and verify ownership
         let folder_service = &state.applications.folder_service;
 
-        match folder_service.get_folder(&id).await {
+        match folder_service
+            .get_folder_with_perms(&id, auth_user.id)
+            .await
+        {
             Ok(folder) => {
-                // Access check: folder must belong to the requesting user
-                if folder.owner_id.as_deref() != Some(&auth_user.id.to_string()) {
-                    tracing::warn!(
-                        "download_folder_zip: user '{}' attempted to download folder '{}' owned by '{:?}'",
-                        auth_user.id,
-                        id,
-                        folder.owner_id
-                    );
-                    return (
-                        StatusCode::NOT_FOUND,
-                        Json(serde_json::json!({ "error": "Folder not found" })),
-                    )
-                        .into_response();
-                }
                 tracing::info!("Preparing ZIP for folder: {} ({})", folder.name, id);
 
                 // Use ZIP service from DI container

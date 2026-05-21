@@ -387,7 +387,7 @@ use crate::common::stubs::StubFileRetrievalUseCase;
 async fn stub_get_file_owned_returns_ok() {
     let user_id = Uuid::new_v4();
     let stub = StubFileRetrievalUseCase;
-    let result = stub.get_file_owned("file-1", user_id).await;
+    let result = stub.get_file_with_perms("file-1", user_id).await;
     assert!(result.is_ok(), "stub should return Ok for get_file_owned");
 }
 
@@ -396,7 +396,7 @@ async fn stub_get_file_optimized_owned_returns_ok() {
     let user_id = Uuid::new_v4();
     let stub = StubFileRetrievalUseCase;
     let result = stub
-        .get_file_optimized_owned("file-1", user_id, true, false)
+        .get_file_optimized_with_perms("file-1", user_id, true, false)
         .await;
     assert!(
         result.is_ok(),

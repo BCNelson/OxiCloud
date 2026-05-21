@@ -5,6 +5,7 @@
 //! `AuthorizationEngine` port consumes them and the `PgAclEngine` implementation
 //! maps them to / from `storage.access_grants` rows.
 
+use std::fmt;
 use uuid::Uuid;
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -60,6 +61,12 @@ impl Subject {
     }
 }
 
+impl fmt::Display for Subject {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}({})", self.type_str(), self.id())
+    }
+}
+
 // ════════════════════════════════════════════════════════════════════════════
 // Resource — what the permission is on
 // ════════════════════════════════════════════════════════════════════════════
@@ -68,6 +75,12 @@ impl Subject {
 pub enum Resource {
     Folder(Uuid),
     File(Uuid),
+    // Reserved for future use:
+    // Calendar(Uuid),
+    // Reserved for future use:
+    // AddressBook(Uuid),
+    // Reserved for future use:
+    // Playlist(Uuid),
 }
 
 impl Resource {
@@ -75,12 +88,20 @@ impl Resource {
         match self {
             Resource::Folder(_) => "folder",
             Resource::File(_) => "file",
+            //Resource::Calendar(_) => "calendar",
+            //Resource::AddressBook(_) => "adressbook",
+            //Resource::Playlist(_) => "playlist",
         }
     }
 
     pub fn id(&self) -> Uuid {
         match self {
-            Resource::Folder(id) | Resource::File(id) => *id,
+            Resource::Folder(id)
+            | Resource::File(id)
+            //| Resource::Calendar(id)
+            //| Resource::AddressBook(id)
+            //| Resource::Playlist(id)
+            => *id,
         }
     }
 
@@ -88,8 +109,17 @@ impl Resource {
         match resource_type {
             "folder" => Some(Resource::Folder(id)),
             "file" => Some(Resource::File(id)),
+            //"calendar" => Some(Resource::Calendar(id)),
+            //"adressbook" => Some(Resource::AddressBook(id)),
+            //"playlist" => Some(Resource::Playlist(id)),
             _ => None,
         }
+    }
+}
+
+impl fmt::Display for Resource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}({})", self.type_str(), self.id())
     }
 }
 
@@ -148,6 +178,12 @@ impl Permission {
             "update" => Some(Permission::Update),
             _ => None,
         }
+    }
+}
+
+impl fmt::Display for Permission {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.as_str())
     }
 }
 

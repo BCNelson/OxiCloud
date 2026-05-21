@@ -36,12 +36,25 @@ pub trait AuthorizationEngine: Send + Sync + 'static {
         resource: Resource,
     ) -> Result<(), DomainError> {
         if self.check(subject, permission, resource).await? {
+            tracing::debug!(
+                "👮🏻‍♂️ perms: ✔ Subject '{}' has permission to '{}' on resource '{}'",
+                subject,
+                permission,
+                resource
+            );
             Ok(())
         } else {
             let (kind, id) = match resource {
                 Resource::Folder(id) => ("Folder", id),
                 Resource::File(id) => ("File", id),
             };
+            // log it for audit
+            tracing::info!(
+                "👮🏻‍♂️ perms: ⛔ Subject '{}' hasn't permission to '{}' on resource '{}'",
+                subject,
+                permission,
+                resource
+            );
             Err(DomainError::not_found(kind, id.to_string()))
         }
     }

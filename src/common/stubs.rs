@@ -34,6 +34,7 @@ use crate::common::errors::DomainError;
 use crate::domain::entities::file::File;
 use crate::domain::entities::folder::Folder;
 use crate::domain::repositories::folder_repository::FolderRepository;
+use crate::domain::services::authorization::Permission;
 use crate::domain::services::i18n_service::{I18nResult, I18nService, Locale};
 use crate::domain::services::path_service::StoragePath;
 
@@ -355,6 +356,15 @@ impl I18nService for StubI18nService {
 pub struct StubFolderUseCase;
 
 impl FolderUseCase for StubFolderUseCase {
+    async fn has_permission(
+        &self,
+        _caller_id: Uuid,
+        _permission: Permission,
+        _file_id: &str,
+    ) -> Result<(), DomainError> {
+        Ok(())
+    }
+
     async fn create_folder_with_perms(
         &self,
         _dto: CreateFolderDto,
@@ -383,7 +393,7 @@ impl FolderUseCase for StubFolderUseCase {
         Ok(Vec::new())
     }
 
-    async fn list_folders_for_owner(
+    async fn list_folders_with_perms(
         &self,
         _parent_id: Option<&str>,
         _owner_id: Uuid,
@@ -399,7 +409,7 @@ impl FolderUseCase for StubFolderUseCase {
         Ok(PaginatedResponseDto::new(Vec::new(), 0, 10, 0))
     }
 
-    async fn list_folders_for_owner_paginated(
+    async fn list_folders_paginated_with_perms(
         &self,
         _parent_id: Option<&str>,
         _owner_id: Uuid,
@@ -521,7 +531,7 @@ impl FileRetrievalUseCase for StubFileRetrievalUseCase {
         Ok(Vec::new())
     }
 
-    async fn list_files_owned(
+    async fn list_files_with_perms(
         &self,
         _folder_id: Option<&str>,
         _owner_id: Uuid,
@@ -537,7 +547,7 @@ impl FileRetrievalUseCase for StubFileRetrievalUseCase {
         Ok(Box::new(empty_stream))
     }
 
-    async fn get_file_stream_owned(
+    async fn get_file_stream_with_perms(
         &self,
         _id: &str,
         _caller_id: Uuid,
@@ -583,11 +593,15 @@ impl FileRetrievalUseCase for StubFileRetrievalUseCase {
         Ok(Box::pin(futures::stream::empty()))
     }
 
-    async fn get_file_owned(&self, _id: &str, _caller_id: Uuid) -> Result<FileDto, DomainError> {
+    async fn get_file_with_perms(
+        &self,
+        _id: &str,
+        _caller_id: Uuid,
+    ) -> Result<FileDto, DomainError> {
         Ok(FileDto::default())
     }
 
-    async fn get_file_optimized_owned(
+    async fn get_file_optimized_with_perms(
         &self,
         _id: &str,
         _caller_id: Uuid,
@@ -604,7 +618,7 @@ impl FileRetrievalUseCase for StubFileRetrievalUseCase {
         ))
     }
 
-    async fn get_file_range_stream_owned(
+    async fn get_file_range_stream_with_perms(
         &self,
         _id: &str,
         _caller_id: Uuid,
@@ -623,6 +637,15 @@ impl FileRetrievalUseCase for StubFileRetrievalUseCase {
 pub struct StubFileManagementUseCase;
 
 impl FileManagementUseCase for StubFileManagementUseCase {
+    async fn has_permission(
+        &self,
+        _caller_id: Uuid,
+        _permission: Permission,
+        _file_id: &str,
+    ) -> Result<(), DomainError> {
+        Ok(())
+    }
+
     async fn copy_file_with_perms(
         &self,
         _file_id: &str,

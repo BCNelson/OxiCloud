@@ -225,6 +225,18 @@ impl FileManagementService {
 }
 
 impl FileManagementUseCase for FileManagementService {
+    async fn has_permission(
+        &self,
+        caller_id: Uuid,
+        permission: Permission,
+        file_id: &str,
+    ) -> Result<(), DomainError> {
+        let uuid = Uuid::parse_str(file_id).map_err(|_| DomainError::not_found("File", file_id))?;
+        self.authz
+            .require(Subject::User(caller_id), permission, Resource::File(uuid))
+            .await
+    }
+
     async fn move_file_with_perms(
         &self,
         file_id: &str,

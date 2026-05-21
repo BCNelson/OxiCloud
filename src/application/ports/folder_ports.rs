@@ -6,8 +6,16 @@ use crate::application::dtos::folder_dto::{
 };
 
 use crate::common::errors::DomainError;
+use crate::domain::services::authorization::Permission;
 
 pub trait FolderUseCase: Send + Sync + 'static {
+    async fn has_permission(
+        &self,
+        caller_id: Uuid,
+        permission: Permission,
+        folder_id: &str,
+    ) -> Result<(), DomainError>;
+
     /// Creates a new folder
     async fn create_folder_with_perms(
         &self,
@@ -36,7 +44,7 @@ pub trait FolderUseCase: Send + Sync + 'static {
 
     /// Lists folders scoped to a specific owner (for user-facing endpoints).
     /// At root level, only returns folders belonging to this user.
-    async fn list_folders_for_owner(
+    async fn list_folders_with_perms(
         &self,
         parent_id: Option<&str>,
         owner_id: Uuid,
@@ -50,7 +58,7 @@ pub trait FolderUseCase: Send + Sync + 'static {
     ) -> Result<crate::application::dtos::pagination::PaginatedResponseDto<FolderDto>, DomainError>;
 
     /// Lists folders with pagination, scoped to a specific owner.
-    async fn list_folders_for_owner_paginated(
+    async fn list_folders_paginated_with_perms(
         &self,
         parent_id: Option<&str>,
         owner_id: Uuid,

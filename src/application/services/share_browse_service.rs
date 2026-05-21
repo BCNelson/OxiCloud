@@ -179,9 +179,9 @@ impl ShareBrowseService {
     ) -> Result<FolderListingDto, DomainError> {
         let (folders_res, files_res) = tokio::join!(
             self.folder_service
-                .list_folders_for_owner(Some(parent_folder_id), owner_id),
+                .list_folders_with_perms(Some(parent_folder_id), owner_id),
             self.file_retrieval
-                .list_files_owned(Some(parent_folder_id), owner_id),
+                .list_files_with_perms(Some(parent_folder_id), owner_id),
         );
         Ok(FolderListingDto {
             folders: folders_res?,

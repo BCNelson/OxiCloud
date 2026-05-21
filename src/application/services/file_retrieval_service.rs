@@ -64,6 +64,8 @@ impl FileRetrievalService {
         }
     }
 
+    // ── private helpers ──────────────────────────────────────────
+
     /// Helper: require the caller has `perm` on the given file id.
     /// Fail-closed if no engine was injected (stub/test path).
     async fn require_file(
@@ -81,7 +83,25 @@ impl FileRetrievalService {
             .await
     }
 
-    // ── private helpers ──────────────────────────────────────────
+    /// Engine check for a target folder. `None` is allowed (root namespace,
+    /// implicitly owned by the caller).
+    async fn require_target_folder_perm(
+        &self,
+        folder_id: Option<&str>,
+        perm: Permission,
+        caller_id: Uuid,
+    ) -> Result<(), DomainError> {
+        let Some(target) = folder_id else {
+            return Ok(());
+        };
+        let authz = self.authz.as_ref().ok_or_else(|| {
+            DomainError::internal_error("FileRetrieval", "Authorization engine unavailable")
+        })?;
+        let uuid = Uuid::parse_str(target).map_err(|_| DomainError::not_found("Folder", target))?;
+        authz
+            .require(Subject::User(caller_id), perm, Resource::Folder(uuid))
+            .await
+    }
 
     /// Try to transcode image content to WebP and return transcoded variant.
     async fn try_transcode(
@@ -229,12 +249,13 @@ impl FileRetrievalUseCase for FileRetrievalService {
         Ok(FileDto::from(file))
     }
 
-    async fn get_file_owned(&self, id: &str, caller_id: Uuid) -> Result<FileDto, DomainError> {
+    async fn get_file_with_perms(&self, id: &str, caller_id: Uuid) -> Result<FileDto, DomainError> {
         self.require_file(id, Permission::Read, caller_id).await?;
         let file = self.file_read.get_file(id).await?;
         Ok(FileDto::from(file))
     }
 
+    // FIXME no authorisation at all
     async fn get_file_by_path(&self, path: &str) -> Result<FileDto, DomainError> {
         // Direct SQL lookup — O(folder_depth) queries instead of O(total_files)
         // NOTE: This method does NOT perform any authorization check. Callers
@@ -256,16 +277,24 @@ impl FileRetrievalUseCase for FileRetrievalService {
         Ok(files.into_iter().map(FileDto::from).collect())
     }
 
-    async fn list_files_owned(
+    async fn list_files_with_perms(
         &self,
         folder_id: Option<&str>,
         owner_id: Uuid,
     ) -> Result<Vec<FileDto>, DomainError> {
-        let files = self
-            .file_read
-            .list_files_for_owner(folder_id, owner_id)
-            .await?;
-        Ok(files.into_iter().map(FileDto::from).collect())
+        if folder_id.is_some() {
+            // folder id is defined, check permissions
+            self.require_target_folder_perm(folder_id, Permission::Read, owner_id)
+                .await?;
+            self.list_files(folder_id).await
+        } else {
+            // no folder id, get owners's files' root
+            let files = self
+                .file_read
+                .list_files_for_owner(folder_id, owner_id)
+                .await?;
+            Ok(files.into_iter().map(FileDto::from).collect())
+        }
     }
 
     async fn get_file_stream(
@@ -275,7 +304,7 @@ impl FileRetrievalUseCase for FileRetrievalService {
         self.file_read.get_file_stream(id).await
     }
 
-    async fn get_file_stream_owned(
+    async fn get_file_stream_with_perms(
         &self,
         id: &str,
         caller_id: Uuid,
@@ -297,7 +326,7 @@ impl FileRetrievalUseCase for FileRetrievalService {
             .await
     }
 
-    async fn get_file_optimized_owned(
+    async fn get_file_optimized_with_perms(
         &self,
         id: &str,
         caller_id: Uuid,
@@ -333,7 +362,7 @@ impl FileRetrievalUseCase for FileRetrievalService {
         self.file_read.get_file_range_stream(id, start, end).await
     }
 
-    async fn get_file_range_stream_owned(
+    async fn get_file_range_stream_with_perms(
         &self,
         id: &str,
         caller_id: Uuid,
@@ -344,6 +373,7 @@ impl FileRetrievalUseCase for FileRetrievalService {
         self.file_read.get_file_range_stream(id, start, end).await
     }
 
+    // TODO: check: no permission check
     async fn stream_files_in_subtree(
         &self,
         folder_id: &str,
@@ -366,13 +396,24 @@ impl FileRetrievalUseCase for FileRetrievalService {
         Ok(files.into_iter().map(FileDto::from).collect())
     }
 
-    async fn list_files_batch_for_owner(
+    async fn list_files_batch_with_perms(
         &self,
         folder_id: Option<&str>,
         owner_id: Uuid,
         offset: i64,
         limit: i64,
     ) -> Result<Vec<FileDto>, DomainError> {
+        if folder_id.is_some() {
+            // folder id is defined, check permissions
+            self.require_target_folder_perm(folder_id, Permission::Read, owner_id)
+                .await?;
+            let files = self
+                .file_read
+                .list_files_batch(folder_id, offset, limit)
+                .await?;
+            return Ok(files.into_iter().map(FileDto::from).collect());
+        }
+
         let files = self
             .file_read
             .list_files_batch_for_owner(folder_id, owner_id, offset, limit)

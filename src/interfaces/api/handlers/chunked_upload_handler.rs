@@ -90,6 +90,8 @@ impl ChunkedUploadHandler {
     ///   "expires_at": 86400
     /// }
     /// ```
+    /// TODO: how is implemented security (owneship, permission ?)
+    /// current caveat: upload can start without know is path permits upload
     pub(super) async fn create_upload_impl(
         State(state): State<Arc<AppState>>,
         auth_user: AuthUser,
@@ -264,6 +266,7 @@ impl ChunkedUploadHandler {
     /// POST /api/uploads/:upload_id/complete - Finalize upload
     ///
     /// Assembles all chunks into the final file and creates the file record
+    // TODO: how is implemented security (owneship, permission ?)
     pub(super) async fn complete_upload_impl(
         State(state): State<Arc<AppState>>,
         auth_user: AuthUser,
