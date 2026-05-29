@@ -13,7 +13,6 @@ import { photosView } from '../features/library/photos.js';
 import { favoritesView } from '../views/favorites/favoritesView.js';
 import { mySharesView } from '../views/myShares/mySharesView.js';
 import { recentView } from '../views/recent/recentView.js';
-import { sharedView } from '../views/shared/sharedView.js';
 import { sharedWithMeView } from '../views/sharedWithMe/sharedWithMeView.js';
 import { filesView, loadFiles } from './filesView.js';
 import { setActionsBarMode, setGroupByView, syncGroupByMenu } from './main.js';
@@ -166,9 +165,8 @@ function setCurrentSection(section) {
         appElements.pageTitle.setAttribute('data-i18n', titleKey);
     }
 
-    // Hide sharedView and mySharesView when switching to any other section
+    // Hide mySharesView when switching to any other section
     if (section !== 'shared') {
-        if (sharedView) sharedView.hide();
         mySharesView.hide();
     }
 
@@ -301,10 +299,7 @@ function switchToFilesSection() {
     ui.updateBreadcrumb();
     if (batchToolbar) batchToolbar.clear();
 
-    // temp solution
-    sharedView.loadItems().then(() => {
-        loadFiles();
-    });
+    loadFiles();
 }
 
 function switchToFavoritesSection() {

@@ -18,7 +18,6 @@ import { recent } from '../features/library/recent.js';
 import { fileSharing } from '../features/sharing/fileSharing.js';
 import { grants } from '../model/grants.js';
 import { recentView } from '../views/recent/recentView.js';
-import { sharedView } from '../views/shared/sharedView.js';
 import { checkAuthentication } from './authSession.js';
 import { loadFiles } from './filesView.js';
 import {
@@ -700,11 +699,8 @@ function setupEventListeners() {
             if (searchDebounceTimer) clearTimeout(searchDebounceTimer);
             const query = elements.searchInput?.value.trim();
 
-            // In shared section, filter locally
-            if (app.currentSection === 'shared' && sharedView) {
-                sharedView.filterAndSortItems();
-                return;
-            }
+            // My Shares section does not support in-page search
+            if (app.currentSection === 'shared') return;
 
             if (query) {
                 performSearch(query);

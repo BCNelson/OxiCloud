@@ -35,12 +35,7 @@ const fileSharing = {
             item_name: options.item_name || null,
             item_type: itemType,
             password: options.password || null,
-            expires_at: options.expires_at ? Math.floor(new Date(options.expires_at).getTime() / 1000) : null,
-            permissions: options.permissions || {
-                read: true,
-                write: false,
-                reshare: false
-            }
+            expires_at: options.expires_at ? Math.floor(new Date(options.expires_at).getTime() / 1000) : null
         };
 
         const res = await fetch('/api/shares', {
@@ -113,12 +108,11 @@ const fileSharing = {
     /**
      * Update a shared link
      * @param {string} shareId
-     * @param {UpdateShare} updateData - { permissions, password, expires_at }
+     * @param {UpdateShare} updateData - { password, expires_at }
      * @returns {Promise<Object>} Updated ShareDto
      */
     async updateSharedLink(shareId, updateData) {
         const body = {};
-        if (updateData.permissions) body.permissions = updateData.permissions;
         if (updateData.password !== undefined) body.password = updateData.password;
         if (updateData.expires_at !== undefined) body.expires_at = updateData.expires_at;
 

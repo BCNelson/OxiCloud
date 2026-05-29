@@ -858,8 +858,7 @@ const shareModal = {
                     const expiresTs = e._draft.expires_at ? Math.floor(new Date(e._draft.expires_at).getTime() / 1000) : null;
                     await fileSharing.updateSharedLink(e.share.id, {
                         password: e._draft.password,
-                        expires_at: expiresTs,
-                        permissions: null
+                        expires_at: expiresTs
                     });
                 }
             }

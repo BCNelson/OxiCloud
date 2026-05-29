@@ -47,13 +47,6 @@
  */
 
 /**
- * @typedef {Object} SharePermissions
- * @property {boolean} read
- * @property {boolean} reshare
- * @property {boolean} write
- */
-
-/**
  * @typedef {Object} ShareItem
  * @property {number} access_count
  * @property {number} created_at - timestamp
@@ -64,7 +57,6 @@
  * @property {string} item_id
  * @property {string} item_name
  * @property {ItemTypeEnum} item_type
- * @property {SharePermissions} permissions
  * @property {string | null} token
  * @property {string} url
  */
@@ -76,14 +68,12 @@
  * @property {ItemTypeEnum} item_type
  * @property {string|null} password
  * @property {number|null} expires_at - timestamp
- * @property {SharePermissions|null} permissions
  */
 
 /**
  * @typedef {Object} UpdateShare
- * @property {string|null}            [password]
- * @property {number|null}            [expires_at]
- * @property {SharePermissions|null}  [permissions]
+ * @property {string|null}  [password]
+ * @property {number|null}  [expires_at]
  */
 
 /**
