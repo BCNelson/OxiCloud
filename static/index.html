@@ -136,12 +136,17 @@
             <button class="search-back-btn" id="search-back-btn" aria-label="Close search">
                 <i class="fas fa-arrow-left"></i>
             </button>
-            <div class="search-container">
-                <i class="fas fa-search search-icon"></i>
-                <input type="text" id="search-input" data-i18n-placeholder="actions.search" placeholder="Search files, folders...">
-                <button id="search-button" class="search-button" data-i18n-title="actions.search_btn" title="Search">
-                    <i class="fas fa-search"></i>
-                </button>
+            <!-- Search slot — positioning context for the item tooltip, which
+                 absolutely overlays the search bar when an item is hovered. -->
+            <div class="search-slot">
+                <div class="search-container">
+                    <i class="fas fa-search search-icon"></i>
+                    <input type="text" id="search-input" data-i18n-placeholder="actions.search" placeholder="Search files, folders...">
+                    <button id="search-button" class="search-button" data-i18n-title="actions.search_btn" title="Search">
+                        <i class="fas fa-search"></i>
+                    </button>
+                </div>
+                <div id="path-tooltip" class="path-tooltip hidden" aria-hidden="true"></div>
             </div>
 
             <div class="user-controls">
