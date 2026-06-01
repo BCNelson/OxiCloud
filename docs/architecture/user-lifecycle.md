@@ -155,7 +155,6 @@ DELETE FROM auth.users WHERE id = $1
     ▼
 COMMIT
 ```
-
 If any hook returns `Err`, the dispatcher propagates it; `delete_user_admin` rolls back the transaction and surfaces the error to the admin endpoint as a 500. The user row, all sessions, all folders/files, all grants — everything stays in place. Hook implementors should keep that strong constraint in mind: returning `Err` from `on_user_deleted` is a heavy hammer.
 
 ### Worked example: brand-new user logs in for the first time
@@ -171,6 +170,30 @@ If any hook returns `Err`, the dispatcher propagates it; `delete_user_admin` rol
 On the user's **second** login: same flow up through step 5, but `ensure_home_folder` finds the existing folder, returns `Ok(false)`, no-op. The `AuditLifecycleHook` still emits an event, but `first_login = false` this time.
 
 If the home folder gets deleted manually (e.g., SQL `DELETE FROM storage.folders WHERE user_id = $1`), the user's **next** login will re-create it — that's the safety-net behaviour the lifecycle hook contractually owns.
+
+### State of the art:
+
+```text
+  DI builds:
+    UserLifecycleService
+      ├── AuditLifecycleHook              (in user_lifecycle_service.rs)
+      ├── HomeFolderLifecycleHook         (in folder_service.rs)
+      ├── AuthzCacheLifecycleHook         (in pg_acl_engine.rs)
+      ├── SessionRevocationLifecycleHook  (in user_lifecycle_service.rs)
+      └── ExternalIdentityLifecycleHook   (in external_identity_service.rs, stubbed)
+
+  AuthApplicationService fires the dispatcher from:
+    ├── register()                  → dispatch_created
+    ├── setup_create_admin()        → dispatch_created
+    ├── admin_create_user()         → dispatch_created
+    ├── OIDC JIT new-user           → dispatch_created + dispatch_login
+    ├── login()                     → dispatch_login (BEFORE register_login)
+    ├── OIDC existing-user login    → dispatch_login (BEFORE register_login)
+    ├── logout()                    → dispatch_logout(UserInitiated)
+    ├── refresh_token reuse         → dispatch_logout(TokenReused)
+    ├── change_password()           → dispatch_logout(PasswordChanged)
+    └── delete_user_admin()         → dispatch_deleted(AdminDelete, tx) — abort-on-Err
+```
 
 ## Future events (NOT shipped — design door)
 
