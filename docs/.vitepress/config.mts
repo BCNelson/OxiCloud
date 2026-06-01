@@ -11,6 +11,17 @@ export default defineConfig({
     lastmodDateOnly: false,
   },
 
+  // Internal planning notes (docs/plan/*) and AI hand-off prompts
+  // aren't user-facing docs and contain raw Rust/pseudocode whose
+  // generics (Option<String>, Vec<SubjectGroup>, …) trip Vue's
+  // template parser ("Element is missing end tag" because <String>,
+  // <SubjectGroup>, etc. look like unclosed HTML tags). Keep them
+  // in-tree for engineering reference but skip them at site-build time.
+  srcExclude: [
+    "plan/**",
+    "**/*.prompt",
+  ],
+
   markdown: {
     image: {
       lazyLoading: true,
