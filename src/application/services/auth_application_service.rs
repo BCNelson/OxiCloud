@@ -420,11 +420,32 @@ impl AuthApplicationService {
             .get_user_by_username(&dto.username)
             .await
             .map_err(|_| {
+                // Audit: unknown-username login attempt. Reason key kept
+                // stable so log search can aggregate without parsing the
+                // human-readable message. Caller's client IP + request id
+                // are attached automatically by the request-scope span.
+                tracing::info!(
+                    target: "audit",
+                    event = "auth.login_rejected",
+                    reason = "unknown_user",
+                    attempted_username = %dto.username,
+                    "🔐 login rejected: no such user '{}'",
+                    dto.username,
+                );
                 DomainError::new(ErrorKind::AccessDenied, "Auth", "Invalid credentials")
             })?;
 
         // Check if user is active
         if !user.is_active() {
+            tracing::info!(
+                target: "audit",
+                event = "auth.login_rejected",
+                reason = "account_deactivated",
+                user_id = %user.id(),
+                username = %user.username(),
+                "🔐 login rejected: account deactivated for '{}'",
+                user.username(),
+            );
             return Err(DomainError::new(
                 ErrorKind::AccessDenied,
                 "Auth",
@@ -439,6 +460,15 @@ impl AuthApplicationService {
             .await?;
 
         if !is_valid {
+            tracing::info!(
+                target: "audit",
+                event = "auth.login_rejected",
+                reason = "bad_password",
+                user_id = %user.id(),
+                username = %user.username(),
+                "🔐 login rejected: bad password for '{}'",
+                user.username(),
+            );
             return Err(DomainError::new(
                 ErrorKind::AccessDenied,
                 "Auth",
@@ -514,6 +544,19 @@ impl AuthApplicationService {
         })?;
 
         let mlt = repo.find_by_token(token).await?.ok_or_else(|| {
+            // Audit: unknown / forged magic-link redemption. The first
+            // 8 chars of the bogus token are logged so a recurring
+            // probe pattern is recognisable without dumping the full
+            // secret to the log stream.
+            let token_preview: String = token.chars().take(8).collect();
+            tracing::info!(
+                target: "audit",
+                event = "magic_link.redemption_rejected",
+                reason = "unknown_token",
+                token_prefix = %token_preview,
+                "🔗 magic-link rejected: unknown token (prefix='{}…')",
+                token_preview,
+            );
             DomainError::new(
                 ErrorKind::NotFound,
                 "MagicLink",
@@ -524,6 +567,15 @@ impl AuthApplicationService {
         // Friendly early-rejection messages. The atomic `mark_used`
         // below is the canonical single-use guard.
         if mlt.status() == MagicLinkStatus::Used {
+            tracing::info!(
+                target: "audit",
+                event = "magic_link.redemption_rejected",
+                reason = "already_used",
+                token_id = %mlt.id(),
+                user_id = %mlt.user_id(),
+                "🔗 magic-link rejected: token already used for user {}",
+                mlt.user_id(),
+            );
             return Err(DomainError::new(
                 ErrorKind::AccessDenied,
                 "MagicLink",
@@ -531,6 +583,15 @@ impl AuthApplicationService {
             ));
         }
         if mlt.is_expired() {
+            tracing::info!(
+                target: "audit",
+                event = "magic_link.redemption_rejected",
+                reason = "expired",
+                token_id = %mlt.id(),
+                user_id = %mlt.user_id(),
+                "🔗 magic-link rejected: token expired for user {}",
+                mlt.user_id(),
+            );
             return Err(DomainError::new(
                 ErrorKind::AccessDenied,
                 "MagicLink",
@@ -542,6 +603,15 @@ impl AuthApplicationService {
         if !consumed {
             // Either a concurrent redemption beat us, or the row was
             // marked expired by the sweeper between our find and update.
+            tracing::info!(
+                target: "audit",
+                event = "magic_link.redemption_rejected",
+                reason = "race_or_swept",
+                token_id = %mlt.id(),
+                user_id = %mlt.user_id(),
+                "🔗 magic-link rejected: lost race to mark_used (user {})",
+                mlt.user_id(),
+            );
             return Err(DomainError::new(
                 ErrorKind::AccessDenied,
                 "MagicLink",
@@ -551,6 +621,16 @@ impl AuthApplicationService {
 
         let mut user = self.user_storage.get_user_by_id(mlt.user_id()).await?;
         if !user.is_active() {
+            tracing::info!(
+                target: "audit",
+                event = "magic_link.redemption_rejected",
+                reason = "account_deactivated",
+                token_id = %mlt.id(),
+                user_id = %user.id(),
+                username = %user.username(),
+                "🔗 magic-link rejected: account deactivated for '{}'",
+                user.username(),
+            );
             return Err(DomainError::new(
                 ErrorKind::AccessDenied,
                 "Auth",
@@ -947,6 +1027,17 @@ impl AuthApplicationService {
         let target = match self.user_storage.get_user_by_id(target_id).await {
             Ok(u) => u,
             Err(e) if e.kind == ErrorKind::NotFound => {
+                tracing::info!(
+                    target: "audit",
+                    event = "user_profile.rejected",
+                    reason = "target_not_found",
+                    caller_id = %caller_id,
+                    caller_is_external = caller.is_external(),
+                    target_id = %target_id,
+                    "👮🏻‍♂️ user-profile rejected: target '{}' does not exist (caller {})",
+                    target_id,
+                    caller_id,
+                );
                 return Err(DomainError::new(
                     ErrorKind::NotFound,
                     "User",
@@ -982,6 +1073,20 @@ impl AuthApplicationService {
 
         // (3) External callers stop here — no directory enumeration.
         if caller.is_external() {
+            // Audit: an external user tried to look up someone they
+            // don't share a grant with. Surfaces enumeration probes
+            // from compromised magic-link sessions.
+            tracing::info!(
+                target: "audit",
+                event = "user_profile.rejected",
+                reason = "external_caller_no_relationship",
+                caller_id = %caller_id,
+                target_id = %target_id,
+                target_is_external = target.is_external(),
+                "👮🏻‍♂️ user-profile rejected: external user '{}' has no grant relationship with '{}'",
+                caller_id,
+                target_id,
+            );
             return Err(DomainError::new(
                 ErrorKind::NotFound,
                 "User",
@@ -1000,6 +1105,21 @@ impl AuthApplicationService {
         }
 
         // (6) No relationship — anti-enumeration NotFound.
+        // Audit: an internal user with no visibility path probed a user
+        // they don't share with. Usually benign (stale UI state), but
+        // recurring patterns from the same caller are worth surfacing.
+        tracing::info!(
+            target: "audit",
+            event = "user_profile.rejected",
+            reason = "no_visibility_path",
+            caller_id = %caller_id,
+            target_id = %target_id,
+            target_is_external = target.is_external(),
+            "👮🏻‍♂️ user-profile rejected: internal user '{}' has no visibility on '{}' (target is_external={})",
+            caller_id,
+            target_id,
+            target.is_external(),
+        );
         Err(DomainError::new(
             ErrorKind::NotFound,
             "User",
