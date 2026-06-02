@@ -3729,6 +3729,7 @@ dependencies = [
  "http-body-util",
  "http-range-header",
  "id3",
+ "idna",
  "image",
  "infer 0.19.0",
  "jsonwebtoken",

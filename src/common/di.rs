@@ -678,6 +678,15 @@ impl AppServiceFactory {
         let storage_usage_service: Option<Arc<StorageUsageService>>;
         let mut auth_services: Option<crate::common::di::AuthServices> = None;
         let mut nextcloud_services: Option<NextcloudServices> = None;
+        // Lifted out of the database-services block so PR 9's invite
+        // orchestrator (built at AppState-assembly time below) can share
+        // the same lifecycle dispatcher. The inner block at line ~682
+        // is unconditional and always assigns; the `#[allow]` silences
+        // the rustc warning that the `None` initialiser is never read.
+        #[allow(unused_assignments)]
+        let mut user_lifecycle_handle: Option<
+            Arc<crate::application::services::user_lifecycle_service::UserLifecycleService>,
+        > = None;
 
         {
             let favs = self.create_favorites_service(&pool);
@@ -792,6 +801,8 @@ impl AppServiceFactory {
                 tracing::info!("Authentication services initialized successfully");
                 auth_services = Some(services);
             }
+
+            user_lifecycle_handle = Some(user_lifecycle);
         }
 
         // Shared App Password service — created once, used by both NC routes and native API
@@ -911,8 +922,41 @@ impl AppServiceFactory {
                     ),
                 ),
             )),
-            email_sender: build_email_sender(&self.config.smtp),
+            email_sender: None,              // populated below
+            mock_email_sender: None,         // populated below
+            magic_link_invite_service: None, // populated below
         };
+        let email_bundle = build_email_sender(&self.config.smtp);
+        app_state.email_sender = email_bundle.sender;
+        app_state.mock_email_sender = email_bundle.mock;
+
+        // Magic-link invite orchestrator: only when SMTP wired AND the
+        // user-lifecycle dispatcher exists (i.e. auth is enabled).
+        if let (Some(email_sender), Some(lifecycle)) = (
+            app_state.email_sender.clone(),
+            user_lifecycle_handle.clone(),
+        ) {
+            let invite_user_storage = Arc::new(
+                crate::infrastructure::repositories::pg::UserPgRepository::new(pool.clone()),
+            );
+            let invite_magic_link_repo: Arc<
+                dyn crate::domain::repositories::magic_link_token_repository::MagicLinkTokenRepository,
+            > = Arc::new(
+                crate::infrastructure::repositories::pg::MagicLinkTokenPgRepository::new(
+                    pool.clone(),
+                ),
+            );
+            app_state.magic_link_invite_service = Some(Arc::new(
+                crate::application::services::magic_link_invite_service::MagicLinkInviteService::new(
+                    invite_user_storage,
+                    invite_magic_link_repo,
+                    email_sender,
+                    lifecycle,
+                    self.config.magic_link.clone(),
+                    self.config.base_url(),
+                ),
+            ));
+        }
 
         // 9b. Wire admin settings service when auth is available
         if let Some(auth_svc) = &app_state.auth_service {
@@ -1246,6 +1290,18 @@ pub struct AppState {
     /// must return 503 when this is `None` rather than silently dropping
     /// the message.
     pub email_sender: Option<Arc<dyn crate::application::ports::email_sender::EmailSender>>,
+    /// Set alongside `email_sender` when the test harness flag
+    /// `OXICLOUD_SMTP_MOCK=true` is on. Used by the
+    /// `GET /api/admin/smtp/test/captured` test-only endpoint to look up
+    /// recently captured messages. Always `None` in production.
+    pub mock_email_sender:
+        Option<Arc<crate::infrastructure::services::mock_email_sender::MockEmailSender>>,
+    /// Invite-by-email orchestrator — `None` when SMTP isn't configured
+    /// (no `email_sender`). `POST /api/grants` with `subject.type=email`
+    /// returns 503 when this is `None`.
+    pub magic_link_invite_service: Option<
+        Arc<crate::application::services::magic_link_invite_service::MagicLinkInviteService>,
+    >,
 }
 
 // All AppState construction is done via struct literal in build_app_state().
@@ -1276,19 +1332,52 @@ fn build_authorization_engine(
     Arc::new(PgAclEngine::new(pool, folder_repo, file_repo, group_repo))
 }
 
+/// Pair returned by [`build_email_sender`] when wiring DI: the
+/// `EmailSender` trait object used by the rest of the application, plus
+/// (in mock mode only) a typed handle to the same `MockEmailSender` so
+/// the test-only capture endpoint can introspect it without downcasting.
+struct EmailSenderBundle {
+    sender: Option<Arc<dyn crate::application::ports::email_sender::EmailSender>>,
+    mock: Option<Arc<crate::infrastructure::services::mock_email_sender::MockEmailSender>>,
+}
+
 /// Construct the SMTP email sender from config, or return `None` when
 /// SMTP is disabled (`OXICLOUD_SMTP_HOST` empty). Construction errors
 /// (unparseable `From:` mailbox, bad TLS settings) downgrade to `None`
 /// with a `WARN` log — the server still starts, but every magic-link
 /// endpoint will return 503 until the operator fixes the config.
-fn build_email_sender(
-    cfg: &crate::common::config::SmtpConfig,
-) -> Option<Arc<dyn crate::application::ports::email_sender::EmailSender>> {
+///
+/// When `OXICLOUD_SMTP_MOCK=true` (test harness only — never in
+/// production), construction returns an in-process `MockEmailSender`
+/// that captures every message instead of sending it. The harness
+/// retrieves captured messages via `GET /api/admin/smtp/test/captured`.
+fn build_email_sender(cfg: &crate::common::config::SmtpConfig) -> EmailSenderBundle {
+    if std::env::var("OXICLOUD_SMTP_MOCK")
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false)
+    {
+        tracing::warn!(
+            target: "oxicloud",
+            event = "smtp.mock_enabled",
+            "OXICLOUD_SMTP_MOCK=true — outbound mail is being captured in-process. \
+             Test harness only; never set this in production.",
+        );
+        let mock =
+            Arc::new(crate::infrastructure::services::mock_email_sender::MockEmailSender::new());
+        return EmailSenderBundle {
+            sender: Some(mock.clone()),
+            mock: Some(mock),
+        };
+    }
+
     if !cfg.is_enabled() {
         tracing::info!(
             "SMTP disabled (OXICLOUD_SMTP_HOST empty); magic-link endpoints will return 503"
         );
-        return None;
+        return EmailSenderBundle {
+            sender: None,
+            mock: None,
+        };
     }
     match crate::infrastructure::services::smtp_email_sender::SmtpEmailSender::new(cfg) {
         Ok(sender) => {
@@ -1302,7 +1391,10 @@ fn build_email_sender(
                 user = if cfg.user.is_empty() { "<anon>" } else { "<set>" },
                 "SMTP sender configured",
             );
-            Some(Arc::new(sender))
+            EmailSenderBundle {
+                sender: Some(Arc::new(sender)),
+                mock: None,
+            }
         }
         Err(e) => {
             tracing::warn!(
@@ -1311,7 +1403,10 @@ fn build_email_sender(
                 error = %e,
                 "SMTP configuration is invalid; magic-link endpoints will return 503",
             );
-            None
+            EmailSenderBundle {
+                sender: None,
+                mock: None,
+            }
         }
     }
 }

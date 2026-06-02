@@ -61,6 +61,10 @@ pub fn admin_routes() -> Router<Arc<AppState>> {
         // SMTP diagnostics
         .route("/smtp/info", get(get_smtp_info))
         .route("/smtp/test", post(send_smtp_test))
+        // Test-only capture endpoint. The handler short-circuits to 404
+        // when `OXICLOUD_SMTP_MOCK` is off, so production deployments
+        // can route the path freely without leaking inboxes.
+        .route("/smtp/test/captured", get(get_captured_email))
 }
 
 /// Validate JWT and require admin role. Returns (user_id, role).
@@ -1262,6 +1266,52 @@ async fn get_smtp_info(
     };
 
     Ok(Json(info))
+}
+
+/// GET /api/admin/smtp/test/captured?to=<email> — test-only inbox lookup.
+///
+/// Returns the most recently captured outbound message for `to` when
+/// `OXICLOUD_SMTP_MOCK=true`. In production / non-mock mode this
+/// returns 404 to keep the endpoint inert.
+async fn get_captured_email(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(params): Query<CapturedEmailQuery>,
+) -> Result<impl IntoResponse, AppError> {
+    admin_guard(&state, &headers).await?;
+
+    if !std::env::var("OXICLOUD_SMTP_MOCK")
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false)
+    {
+        return Err(AppError::not_found(
+            "Capture endpoint is only available when OXICLOUD_SMTP_MOCK=true",
+        ));
+    }
+
+    let recipient = params.to.trim();
+    if recipient.is_empty() {
+        return Err(AppError::bad_request("`to` query parameter is required"));
+    }
+
+    let Some(mock) = state.mock_email_sender.as_ref() else {
+        return Err(AppError::not_found(
+            "Mock sender is not active (set OXICLOUD_SMTP_MOCK=true)",
+        ));
+    };
+
+    match mock.last_for(recipient).await {
+        Some(captured) => Ok(Json((*captured).clone())),
+        None => Err(AppError::not_found(format!(
+            "No captured message for '{}'",
+            recipient
+        ))),
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct CapturedEmailQuery {
+    to: String,
 }
 
 /// POST /api/admin/smtp/test — send a diagnostic email to `dto.to`.

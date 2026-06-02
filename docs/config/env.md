@@ -185,6 +185,8 @@ Used by the magic-link invitation flow and the login-via-email flow. When `OXICL
 | `OXICLOUD_SMTP_FROM` | — | `From:` mailbox; bare address or RFC 5322 name-address (`OxiCloud <noreply@example.com>`) |
 | `OXICLOUD_SMTP_TLS` | `starttls` | Transport encryption: `starttls`, `tls`, or `none` (emits startup WARN) |
 
+There is also `OXICLOUD_SMTP_MOCK`  (false by default), this is for test purpose only, do not activate it
+
 ### Reliability and retries
 
 OxiCloud does **not** spool mail. Each `send()` is a single attempt: if the remote SMTP server is unreachable, slow, or temporarily refusing the message, the send fails and the error is logged — there is no in-process retry, queue, or dead-letter handling. This keeps the HTTP path fast and the binary small at the cost of durability guarantees during a relay outage.
