@@ -99,6 +99,7 @@ Forward-only migrations. The previous `…000003_users_username_email_login.sql`
 | **19** | `OXICLOUD_MAGIC_LINK_OPEN_TO_PASSWORD_USERS` env knob + `magic_link_eligibility()` refactor with three audit reasons. | Single env-driven policy switch with observability. |
 | **20** | Anti-enumeration `register`: uniform 200 regardless of outcome, real reasons in audit channel. | Closes the username/email enumeration oracle that survives from the original schema. |
 | **21** | `docs/architecture/auth-model.md` (~250 lines) + sidebar + cross-references. Acceptance gate. | Big-picture documentation of the final identity / credential / login surface. |
+| **22** | Device-bound magic-link redemption (challenge cookie) + asymmetric TTLs: login-via-email tokens live 10 minutes, invitation tokens live 24 hours. | Closes the mailbox-as-bearer-token attack class on the login flow. Invitations stay cross-device (recipient has no prior browser context with the server). |
 
 ## Critical files
 
@@ -220,6 +221,47 @@ Items the conversation explicitly deferred. Each has a clear future trigger.
 - **Open Cloud Mesh (OCM) federation.** Third source for external provisioning. The `ExternalIdentityLifecycleHook::on_user_created` design accommodates the `source` discriminator (`magic_link` / `oidc` / `ocm`).
 - **Recovery codes / passkey enrolment.** Tied to native 2FA above.
 - **Per-user opt-out of magic-link when lenient mode is on.** Today the env flag is instance-wide. A future per-account toggle (e.g. high-privilege admins disabling magic-link for themselves) would need an `auth.users.magic_link_disabled BOOLEAN` column and one extra branch in eligibility. Listed in `auth-model.md`.
+
+### PR 22 — Device-bound magic-link redemption (design recap)
+
+**Threat closed**: today a magic-link URL is a bearer token — anyone who reads the recipient's email can redeem it. PR 22 binds the login-via-email path to the originating browser so mailbox compromise alone no longer grants a session.
+
+**Asymmetric scope** — binding applies to **login-via-email only**, not invitations:
+
+| Flow | Initiator | Bound to browser? | TTL |
+|---|---|---|---|
+| `POST /api/auth/magic-link/send` (login-via-email) | The user themselves, in a browser | Yes (challenge cookie) | **10 minutes** |
+| `POST /api/grants` with `subject.type=email` (invitation) | A sharer, recipient has no prior browser context | No (inherently cross-device) | **24 hours** (existing) |
+
+**Mechanism** (cookie-only, no UX overhaul):
+
+1. `POST /api/auth/magic-link/send` mints the token AND sets `oxicloud_magic_request=<random>` cookie on the requesting browser (HttpOnly, SameSite=Strict, TTL matches token TTL). The cookie value is mirrored onto a new `auth.magic_link_tokens.request_challenge` column.
+2. `GET /magic/v1/{token}` for login-bound tokens checks the cookie:
+   - **Cookie present and matches** → redeem instantly (common case; zero UX change).
+   - **Cookie absent or mismatched** → show a small confirmation page: *"You opened this link in a different browser than you requested it from. If you trust this device, click Continue to sign in."* On click → redeem and audit-log `auth.magic_link_redeem reason="cross_browser_confirmed"`.
+3. Invitation tokens (`resource_id IS NOT NULL`) bypass the check — they have no `request_challenge` to compare against and are cross-device by design.
+
+**Config additions** (replacing single `OXICLOUD_MAGIC_LINK_TTL_HOURS`):
+
+- `OXICLOUD_MAGIC_LINK_LOGIN_TTL_MINUTES` — default 10. Applies to tokens minted by `send_login_link` (no resource target, browser-bound).
+- `OXICLOUD_MAGIC_LINK_INVITE_TTL_HOURS` — default 24. Applies to tokens minted by `issue_invitation` (resource target, recipient is the audience).
+- The old `OXICLOUD_MAGIC_LINK_TTL_HOURS` becomes a deprecated alias for `_INVITE_TTL_HOURS` to avoid breaking existing deployments.
+
+**Schema migration**:
+
+```sql
+ALTER TABLE auth.magic_link_tokens
+    ADD COLUMN request_challenge TEXT NULL;
+COMMENT ON COLUMN auth.magic_link_tokens.request_challenge IS
+    'Random per-request value mirrored into the oxicloud_magic_request cookie. NULL for invitation tokens (cross-device by design); set for login-via-email tokens (browser-bound).';
+```
+
+**Hurl coverage**:
+- Login-via-email: send → capture cookie + mail → redeem with cookie → 302 + session. Same flow without cookie → confirmation HTML page; submit the confirmation form → 302 + session + `cross_browser_confirmed` audit entry.
+- Invitations: send via grants → recipient (different browser, no cookie) → 302 + session (no challenge requested).
+- Login-bound token at 11 minutes → expired; invitation token at 11 minutes → still valid.
+
+**Why this slots in here**: hardens the most attack-prone surface in the auth model. PR 21's `auth-model.md` should describe the bound + asymmetric-TTL model from the start — so PR 22 either lands before PR 21, or PR 21's doc explicitly flags the upcoming work.
 
 ## Locked-in design decisions (confirmed before PR 16)
 
