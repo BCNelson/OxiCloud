@@ -20,9 +20,14 @@
 //!   - Token not found / expired / already used → 410 Gone.
 //!   - Magic-link feature disabled (no SMTP / repo) → 503.
 //!   - Owning user deactivated → 410 Gone.
+//!
+//! Page bodies are rendered via askama templates under
+//! `templates/magic_link/`; all user-visible strings come from the
+//! `server.magic_link.page.*` keys in `static/locales/`.
 
 use std::sync::Arc;
 
+use askama::Template;
 use axum::{
     Router,
     extract::{Path, Query, State},
@@ -35,11 +40,12 @@ use serde::Deserialize;
 use crate::application::services::auth_application_service::{
     MagicLinkRedeemResult, MagicLinkRedemption,
 };
-use crate::application::services::magic_link_invite_service::ResendRecipientHint;
 use crate::common::di::AppState;
 use crate::common::errors::ErrorKind;
+use crate::common::locale::Locale;
 use crate::domain::entities::magic_link_token::MagicLinkResourceKind;
 use crate::interfaces::api::cookie_auth;
+use crate::interfaces::middleware::locale::RequestLocale;
 use crate::interfaces::middleware::rate_limit::extract_client_ip;
 
 /// Build the `/magic/v1/{token}` router. Mounted at the top of the
@@ -82,13 +88,11 @@ async fn redeem_magic_link(
     State(state): State<Arc<AppState>>,
     Path(token): Path<String>,
     Query(query): Query<RedeemQuery>,
+    RequestLocale(locale): RequestLocale,
     headers: HeaderMap,
 ) -> Response {
     let Some(auth_svc) = state.auth_service.as_ref() else {
-        return error_page(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Authentication subsystem is not configured.",
-        );
+        return service_unavailable_page(&state, &locale).await;
     };
 
     // PR 22 browser binding: read the per-request challenge from the
@@ -118,7 +122,7 @@ async fn redeem_magic_link(
             build_success_response(&state, *redemption)
         }
         Ok(MagicLinkRedeemResult::NeedsCrossBrowserConfirm) => {
-            cross_browser_confirmation_page(&token)
+            cross_browser_confirmation_page(&state, &locale, &token).await
         }
         Err(e) => {
             // Log the cause for ops; the user gets a generic page so the
@@ -130,17 +134,11 @@ async fn redeem_magic_link(
                 error = %e.message,
             );
             match e.kind {
-                ErrorKind::NotImplemented => error_page(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "Magic-link sign-in is not enabled on this server.",
-                ),
+                ErrorKind::NotImplemented => service_unavailable_page(&state, &locale).await,
                 ErrorKind::NotFound | ErrorKind::AccessDenied => {
-                    expired_or_used_page(&state, &token).await
+                    expired_or_used_page(&state, &locale, &token).await
                 }
-                _ => error_page(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "Something went wrong while signing you in. Please try again.",
-                ),
+                _ => internal_error_page(&state, &locale).await,
             }
         }
     }
@@ -168,20 +166,19 @@ async fn redeem_magic_link(
 async fn resend_magic_link(
     State(state): State<Arc<AppState>>,
     Path(token): Path<String>,
+    RequestLocale(locale): RequestLocale,
     req: axum::http::Request<axum::body::Body>,
 ) -> Response {
-    let confirmation = || {
-        resend_confirmation_page(
-            "If the sign-in link belonged to an active account, a fresh \
-             link has just been sent. Please check your inbox.",
-        )
+    let confirmation_state = state.clone();
+    let confirmation_locale = locale.clone();
+    let confirmation = move || {
+        let s = confirmation_state.clone();
+        let l = confirmation_locale.clone();
+        async move { resend_confirmation_page(&s, &l).await }
     };
 
     let Some(invite_svc) = state.magic_link_invite_service.as_ref() else {
-        return error_page(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Magic-link sign-in is not enabled on this server.",
-        );
+        return service_unavailable_page(&state, &locale).await;
     };
 
     let client_ip = extract_client_ip(&req);
@@ -201,7 +198,7 @@ async fn resend_magic_link(
             ip = %client_ip,
             "Per-IP rate limit exceeded on /magic/v1/{{token}}/resend"
         );
-        return confirmation();
+        return confirmation().await;
     }
 
     let hint = match invite_svc.lookup_resend_recipient(&token).await {
@@ -209,7 +206,7 @@ async fn resend_magic_link(
         _ => {
             // Unknown / pending / deactivated — uniform response so the
             // outcome is not an oracle for "is this a known token".
-            return confirmation();
+            return confirmation().await;
         }
     };
 
@@ -228,7 +225,7 @@ async fn resend_magic_link(
             ip = %client_ip,
             "Per-target-email rate limit exceeded on /magic/v1/{{token}}/resend"
         );
-        return confirmation();
+        return confirmation().await;
     }
 
     let challenge = cookie_auth::generate_magic_request_challenge();
@@ -244,101 +241,255 @@ async fn resend_magic_link(
             error = %e.message,
             "Resend dispatch failed for an unexpected reason"
         );
-        return error_page(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Something went wrong while sending the link. Please try again.",
-        );
+        return resend_failure_page(&state, &locale).await;
     }
 
-    let mut response = confirmation();
+    let mut response = confirmation().await;
     cookie_auth::append_magic_request_cookie(response.headers_mut(), &challenge, login_ttl_secs);
     response
 }
 
-/// Plain HTML confirmation rendered after the resend button is clicked.
-/// Same shape on every outcome — see [`resend_magic_link`] for why.
-fn resend_confirmation_page(message: &str) -> Response {
-    let body = format!(
-        "<!doctype html><html><head><meta charset=\"utf-8\"><title>OxiCloud</title>\
-         <style>body{{font-family:system-ui,sans-serif;max-width:560px;margin:6em auto;\
-         padding:0 1em;color:#333;line-height:1.5}}h1{{font-size:1.4em}}\
-         .muted{{color:#666;font-size:.9em;margin-top:2em}}</style>\
-         </head><body>\
-         <h1>Check your inbox</h1>\
-         <p>{}</p>\
-         <p class=\"muted\"><a href=\"/\">Return to OxiCloud</a></p>\
-         </body></html>",
-        html_escape(message)
-    );
-    let mut response = (StatusCode::OK, body).into_response();
-    response.headers_mut().insert(
-        CONTENT_TYPE,
-        HeaderValue::from_static("text/html; charset=utf-8"),
-    );
-    response
+// ═══════════════════════════════════════════════════════════════════════════
+// Template structs
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// Each user-visible page maps to one askama-derived struct. The strings
+// they hold are already-resolved translations — the templates themselves
+// are pure layout (HTML structure + escaping), no conditional locale
+// logic. That keeps the template language minimal and pushes all i18n
+// concerns to the call site, where we already have async + an
+// I18nApplicationService handle.
+
+#[derive(Template)]
+#[template(path = "magic_link/page_expired_or_used.html")]
+struct ExpiredOrUsedTemplate {
+    locale_code: String,
+    title: String,
+    body: String,
+    return_link: String,
+    /// `Some` when the row was recoverable (status = expired or used,
+    /// owning user still active) and we want to render the resend
+    /// button. `None` for unknown/pending/deactivated tokens — the page
+    /// then matches the generic shape, no oracle.
+    resend: Option<ResendOffer>,
 }
 
-/// Render the 410-Gone landing for a token that's either expired,
-/// already used, or unknown. When the token belongs to an active user
-/// (i.e. the redemption failed because the row exists but is past its
-/// useful state), the page carries a one-click "send a fresh link"
-/// form pre-targeted at the recipient's masked email. When the token
-/// is unknown, the user is deactivated, or any plumbing is missing,
-/// the page falls back to the existing generic message — by design
-/// the two responses are indistinguishable to the caller.
-async fn expired_or_used_page(state: &Arc<AppState>, token: &str) -> Response {
-    let generic = || {
-        error_page(
-            StatusCode::GONE,
-            "This sign-in link is no longer valid. It may have already been \
-             used or expired. Request a fresh link from the login page.",
+struct ResendOffer {
+    action_url: String,
+    button_label: String,
+}
+
+#[derive(Template)]
+#[template(path = "magic_link/page_cross_browser_confirm.html")]
+struct CrossBrowserConfirmTemplate {
+    locale_code: String,
+    title: String,
+    body: String,
+    warning: String,
+    confirm_url: String,
+    continue_label: String,
+}
+
+#[derive(Template)]
+#[template(path = "magic_link/page_resend_confirmation.html")]
+struct ResendConfirmationTemplate {
+    locale_code: String,
+    title: String,
+    body: String,
+    return_link: String,
+}
+
+#[derive(Template)]
+#[template(path = "magic_link/page_generic_error.html")]
+struct GenericErrorTemplate {
+    locale_code: String,
+    title: String,
+    body: String,
+    return_link: String,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Page builders
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// Helpers that resolve the user-visible strings via i18n, instantiate
+// the template, and wrap the rendered HTML in an axum Response with
+// the right status + Content-Type. The status is the caller's choice,
+// the locale comes from the `RequestLocale` extractor.
+
+/// Pre-resolve the strings shared across nearly every page (the title
+/// fallback and "Return to OxiCloud" footer link). Keeps every builder
+/// terse.
+async fn translate(state: &Arc<AppState>, locale: &Locale, key: &str) -> String {
+    state
+        .applications
+        .i18n_service
+        .translate(key, Some(locale.clone()))
+        .await
+        .unwrap_or_else(|_| key.to_string())
+}
+
+async fn translate_args(
+    state: &Arc<AppState>,
+    locale: &Locale,
+    key: &str,
+    args: &[(&str, &str)],
+) -> String {
+    state
+        .applications
+        .i18n_service
+        .translate_args(key, Some(locale.clone()), args)
+        .await
+        .unwrap_or_else(|_| key.to_string())
+}
+
+async fn expired_or_used_page(state: &Arc<AppState>, locale: &Locale, token: &str) -> Response {
+    let hint = match state.magic_link_invite_service.as_ref() {
+        Some(svc) => svc.lookup_resend_recipient(token).await.ok().flatten(),
+        None => None,
+    };
+
+    let (title, body, resend) = if let Some(hint) = hint {
+        (
+            translate(state, locale, "server.magic_link.page.expired_title").await,
+            translate(state, locale, "server.magic_link.page.expired_body").await,
+            Some(ResendOffer {
+                action_url: format!("/magic/v1/{}/resend", token),
+                button_label: translate_args(
+                    state,
+                    locale,
+                    "server.magic_link.page.resend_to",
+                    &[("email", &hint.masked_email)],
+                )
+                .await,
+            }),
+        )
+    } else {
+        // Generic "no longer valid" page — the body conveys both
+        // outcomes (expired or used) in one sentence to defeat the
+        // oracle.
+        (
+            translate(state, locale, "server.magic_link.page.expired_title").await,
+            translate(state, locale, "server.magic_link.page.generic_unavailable").await,
+            None,
         )
     };
 
-    let Some(invite_svc) = state.magic_link_invite_service.as_ref() else {
-        return generic();
+    let template = ExpiredOrUsedTemplate {
+        locale_code: locale.as_str().to_string(),
+        title,
+        body,
+        return_link: translate(state, locale, "server.magic_link.page.return_link").await,
+        resend,
     };
-    let hint = match invite_svc.lookup_resend_recipient(token).await {
-        Ok(Some(h)) => h,
-        _ => return generic(),
-    };
-    resend_offer_page(token, &hint)
+    render(StatusCode::GONE, template)
 }
 
-/// HTML body for the enriched 410 page: explains the outcome and
-/// offers a single-button form posting to `POST /magic/v1/{token}/resend`.
-/// Plain HTML — no JavaScript, no external assets — so it works the
-/// same in any mail-client embedded browser. The form action is the
-/// only place the token round-trips; the masked email is the only
-/// thing rendered, so screenshots / shoulder-surfing don't expose the
-/// full address.
-fn resend_offer_page(token: &str, hint: &ResendRecipientHint) -> Response {
-    let action = format!("/magic/v1/{}/resend", html_escape(token));
-    let masked = html_escape(&hint.masked_email);
-    let body = format!(
-        "<!doctype html><html><head><meta charset=\"utf-8\"><title>OxiCloud</title>\
-         <style>body{{font-family:system-ui,sans-serif;max-width:560px;margin:6em auto;\
-         padding:0 1em;color:#333;line-height:1.5}}h1{{font-size:1.4em}}\
-         .btn{{display:inline-block;padding:.7em 1.4em;background:#2563eb;color:#fff;\
-         border-radius:6px;text-decoration:none;font-weight:600;margin-top:.4em;\
-         border:0;cursor:pointer;font-size:1em}}.btn:hover{{background:#1d4ed8}}\
-         .muted{{color:#666;font-size:.9em;margin-top:2em}}</style>\
-         </head><body>\
-         <h1>This sign-in link is no longer valid</h1>\
-         <p>The link may have expired or already been used. \
-         We can send you a fresh one — it'll arrive in your inbox in a few seconds.</p>\
-         <form method=\"post\" action=\"{action}\">\
-           <button type=\"submit\" class=\"btn\">Send a fresh link to {masked}</button>\
-         </form>\
-         <p class=\"muted\"><a href=\"/\">Return to OxiCloud</a></p>\
-         </body></html>"
-    );
-    let mut response = (StatusCode::GONE, body).into_response();
-    response.headers_mut().insert(
-        CONTENT_TYPE,
-        HeaderValue::from_static("text/html; charset=utf-8"),
-    );
-    response
+async fn cross_browser_confirmation_page(
+    state: &Arc<AppState>,
+    locale: &Locale,
+    token: &str,
+) -> Response {
+    let template = CrossBrowserConfirmTemplate {
+        locale_code: locale.as_str().to_string(),
+        title: translate(state, locale, "server.magic_link.page.cross_browser_title").await,
+        body: translate(state, locale, "server.magic_link.page.cross_browser_body").await,
+        warning: translate(
+            state,
+            locale,
+            "server.magic_link.page.cross_browser_warning",
+        )
+        .await,
+        confirm_url: format!("/magic/v1/{}?confirm=1", token),
+        continue_label: translate(
+            state,
+            locale,
+            "server.magic_link.page.cross_browser_continue",
+        )
+        .await,
+    };
+    render(StatusCode::OK, template)
+}
+
+async fn resend_confirmation_page(state: &Arc<AppState>, locale: &Locale) -> Response {
+    let template = ResendConfirmationTemplate {
+        locale_code: locale.as_str().to_string(),
+        title: translate(
+            state,
+            locale,
+            "server.magic_link.page.resend_confirmation_title",
+        )
+        .await,
+        body: translate(
+            state,
+            locale,
+            "server.magic_link.page.resend_confirmation_body",
+        )
+        .await,
+        return_link: translate(state, locale, "server.magic_link.page.return_link").await,
+    };
+    render(StatusCode::OK, template)
+}
+
+async fn service_unavailable_page(state: &Arc<AppState>, locale: &Locale) -> Response {
+    let template = GenericErrorTemplate {
+        locale_code: locale.as_str().to_string(),
+        title: translate(state, locale, "server.magic_link.page.expired_title").await,
+        body: translate(state, locale, "server.magic_link.page.service_unavailable").await,
+        return_link: translate(state, locale, "server.magic_link.page.return_link").await,
+    };
+    render(StatusCode::SERVICE_UNAVAILABLE, template)
+}
+
+async fn internal_error_page(state: &Arc<AppState>, locale: &Locale) -> Response {
+    let template = GenericErrorTemplate {
+        locale_code: locale.as_str().to_string(),
+        title: translate(state, locale, "server.magic_link.page.expired_title").await,
+        body: translate(state, locale, "server.magic_link.page.internal_error").await,
+        return_link: translate(state, locale, "server.magic_link.page.return_link").await,
+    };
+    render(StatusCode::INTERNAL_SERVER_ERROR, template)
+}
+
+async fn resend_failure_page(state: &Arc<AppState>, locale: &Locale) -> Response {
+    let template = GenericErrorTemplate {
+        locale_code: locale.as_str().to_string(),
+        title: translate(state, locale, "server.magic_link.page.expired_title").await,
+        body: translate(state, locale, "server.magic_link.page.resend_failure").await,
+        return_link: translate(state, locale, "server.magic_link.page.return_link").await,
+    };
+    render(StatusCode::INTERNAL_SERVER_ERROR, template)
+}
+
+/// Render an askama template into a UTF-8 HTML response with the given
+/// status. Template render failures only happen when a hand-edited
+/// template references a field that doesn't exist on the struct, which
+/// would have failed at compile time — but we still log + return a
+/// minimal fallback rather than panic in production.
+fn render<T: Template>(status: StatusCode, template: T) -> Response {
+    match template.render() {
+        Ok(body) => {
+            let mut response = (status, body).into_response();
+            response.headers_mut().insert(
+                CONTENT_TYPE,
+                HeaderValue::from_static("text/html; charset=utf-8"),
+            );
+            response
+        }
+        Err(e) => {
+            tracing::error!(
+                target: "audit",
+                event = "magic_link.template_render_failed",
+                error = %e,
+                "askama render failed — template definition out of sync with caller"
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Internal error rendering page.",
+            )
+                .into_response()
+        }
+    }
 }
 
 fn build_success_response(state: &Arc<AppState>, redemption: MagicLinkRedemption) -> Response {
@@ -358,46 +509,6 @@ fn build_success_response(state: &Arc<AppState>, redemption: MagicLinkRedemption
     // want a stale value on the browser confusing a later flow.
     cookie_auth::append_clear_magic_request_cookie(response.headers_mut());
 
-    response
-}
-
-/// Render the cross-browser confirmation page (PR 22). Shown when the
-/// magic-link token carries a `request_challenge` (login-via-email)
-/// but the inbound cookie didn't match — typically because the user
-/// requested the link from one browser and clicked it from another
-/// (phone vs desktop, work vs personal). The Continue button submits
-/// back to the same endpoint with `?confirm=1` so the service skips
-/// the challenge check and proceeds with redemption. Audit-logged at
-/// `magic_link.redeemed reason="cross_browser_confirmed"`.
-fn cross_browser_confirmation_page(token: &str) -> Response {
-    let confirm_url = format!("/magic/v1/{}?confirm=1", html_escape(token));
-    let body = format!(
-        "<!doctype html><html><head><meta charset=\"utf-8\">\
-         <title>Sign in — OxiCloud</title>\
-         <style>body{{font-family:system-ui,sans-serif;max-width:520px;margin:6em auto;\
-         padding:0 1em;color:#333;line-height:1.5}}\
-         h1{{font-size:1.4em}}.btn{{display:inline-block;padding:.7em 1.4em;\
-         background:#2563eb;color:#fff;border-radius:6px;text-decoration:none;\
-         font-weight:600;margin-top:1em}}.btn:hover{{background:#1d4ed8}}\
-         .note{{background:#fef3c7;border-left:3px solid #f59e0b;\
-         padding:.75em 1em;margin:1.5em 0;border-radius:4px;font-size:.95em}}</style>\
-         </head><body>\
-         <h1>Continue signing in on this device?</h1>\
-         <p>You opened this sign-in link in a different browser or device than \
-         the one where you requested it.</p>\
-         <p class=\"note\">If <strong>you</strong> requested this link, it's safe to continue. \
-         If you didn't request it, close this page — clicking Continue would sign \
-         someone else into your account.</p>\
-         <p><a class=\"btn\" href=\"{confirm_url}\">Continue and sign in</a></p>\
-         </body></html>",
-        confirm_url = confirm_url,
-    );
-
-    let mut response = (StatusCode::OK, body).into_response();
-    response.headers_mut().insert(
-        CONTENT_TYPE,
-        HeaderValue::from_static("text/html; charset=utf-8"),
-    );
     response
 }
 
@@ -421,30 +532,4 @@ fn redirect_target(redemption: &MagicLinkRedemption) -> String {
         _ if redemption.auth.user.is_external => "/#/sharedwithme".to_string(),
         _ => "/#/files".to_string(),
     }
-}
-
-fn error_page(status: StatusCode, message: &str) -> Response {
-    let body = format!(
-        "<!doctype html><html><head><meta charset=\"utf-8\"><title>OxiCloud</title>\
-         <style>body{{font-family:system-ui,sans-serif;max-width:640px;margin:6em auto;\
-         padding:0 1em;color:#333}}h1{{font-size:1.4em}}p{{line-height:1.5}}</style>\
-         </head><body><h1>Sign-in link</h1><p>{}</p>\
-         <p><a href=\"/\">Return to OxiCloud</a></p></body></html>",
-        html_escape(message)
-    );
-
-    let mut response = (status, body).into_response();
-    response.headers_mut().insert(
-        CONTENT_TYPE,
-        HeaderValue::from_static("text/html; charset=utf-8"),
-    );
-    response
-}
-
-/// Tiny HTML escape — only used in the error fallback page. Anything more
-/// elaborate belongs in a templating layer (not in scope here).
-fn html_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
 }

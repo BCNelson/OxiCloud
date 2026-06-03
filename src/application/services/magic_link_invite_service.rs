@@ -29,12 +29,14 @@
 
 use std::sync::Arc;
 
-use chrono::Utc;
+use askama::Template;
 
 use crate::application::ports::email_sender::{EmailMessage, EmailSender};
+use crate::application::services::i18n_application_service::I18nApplicationService;
 use crate::application::services::user_lifecycle_service::UserLifecycleService;
 use crate::common::config::MagicLinkConfig;
 use crate::common::errors::{DomainError, ErrorKind};
+use crate::common::locale::Locale;
 use crate::domain::entities::magic_link_token::{
     MagicLinkResourceKind, MagicLinkStatus, MagicLinkToken,
 };
@@ -93,6 +95,7 @@ pub struct MagicLinkInviteService {
     magic_link_repo: Arc<dyn MagicLinkTokenRepository>,
     email_sender: Arc<dyn EmailSender>,
     user_lifecycle: Arc<UserLifecycleService>,
+    i18n: Arc<I18nApplicationService>,
     magic_link_cfg: MagicLinkConfig,
     /// Public base URL of this OxiCloud instance — used to build the
     /// `/magic/v1/{token}` invitation link. Sourced from
@@ -101,11 +104,13 @@ pub struct MagicLinkInviteService {
 }
 
 impl MagicLinkInviteService {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         user_storage: Arc<UserPgRepository>,
         magic_link_repo: Arc<dyn MagicLinkTokenRepository>,
         email_sender: Arc<dyn EmailSender>,
         user_lifecycle: Arc<UserLifecycleService>,
+        i18n: Arc<I18nApplicationService>,
         magic_link_cfg: MagicLinkConfig,
         public_base_url: String,
     ) -> Self {
@@ -114,6 +119,7 @@ impl MagicLinkInviteService {
             magic_link_repo,
             email_sender,
             user_lifecycle,
+            i18n,
             magic_link_cfg,
             public_base_url,
         }
@@ -259,30 +265,38 @@ impl MagicLinkInviteService {
             token.token(),
         );
 
-        let kind_label = match resource {
-            Resource::Folder(_) => "folder",
-            Resource::File(_) => "file",
+        let kind_key = match resource {
+            Resource::Folder(_) => "server.magic_link.email.kind_folder",
+            Resource::File(_) => "server.magic_link.email.kind_file",
         };
-        let subject = format!(
-            "{} shared a {} with you on OxiCloud",
-            inviter_username, kind_label
-        );
-        let text_body = format!(
-            "{inviter} shared a {kind} with you on OxiCloud.\n\
-             \n\
-             Open it by clicking the link below:\n\
-             {link}\n\
-             \n\
-             The link works once and expires in {ttl} hours.\n\
-             If you didn't expect this invitation, you can safely ignore this message.\n\
-             \n\
-             — OxiCloud, {now}\n",
-            inviter = inviter_username,
-            kind = kind_label,
-            link = link,
-            ttl = self.magic_link_cfg.invite_ttl_hours,
-            now = Utc::now().to_rfc3339(),
-        );
+        // PR C will resolve the recipient's preferred_locale. For now
+        // (PR B) every magic-link email defaults to the server default
+        // locale; the bilingual partial below means non-English
+        // recipients still see English as a safety net.
+        let locale = Locale::default();
+        let kind_label = self.i18n_or(kind_key, &locale, &[]).await;
+        let ttl_hours = self.magic_link_cfg.invite_ttl_hours.to_string();
+        let invite_args: Vec<(&str, &str)> = vec![
+            ("inviter", inviter_username),
+            ("kind", &kind_label),
+            ("link", &link),
+            ("ttl_hours", &ttl_hours),
+        ];
+
+        let subject = self
+            .i18n_or(
+                "server.magic_link.email.invitation.subject",
+                &locale,
+                &invite_args,
+            )
+            .await;
+        let text_body = self
+            .render_bilingual(
+                "server.magic_link.email.invitation.body",
+                &locale,
+                &invite_args,
+            )
+            .await;
 
         let message = EmailMessage {
             to: recipient.email().to_string(),
@@ -441,24 +455,22 @@ impl MagicLinkInviteService {
             self.public_base_url.trim_end_matches('/'),
             token.token(),
         );
-        let subject = "Sign in to OxiCloud".to_string();
-        let text_body = format!(
-            "Hello,\n\
-             \n\
-             Use the link below to sign in to OxiCloud. The link works \
-             once and expires in {ttl} minutes. Open it on the same \
-             device where you requested it.\n\
-             \n\
-             {link}\n\
-             \n\
-             If you didn't request this sign-in link, you can safely \
-             ignore this message — no further action is needed.\n\
-             \n\
-             — OxiCloud, {now}\n",
-            ttl = self.magic_link_cfg.login_ttl_minutes,
-            link = link,
-            now = Utc::now().to_rfc3339(),
-        );
+        // PR C will switch to `user.preferred_locale` once the column
+        // lands. Today the login-via-email path uses the server default.
+        let locale = Locale::default();
+        let ttl_minutes = self.magic_link_cfg.login_ttl_minutes.to_string();
+        let login_args: Vec<(&str, &str)> = vec![("link", &link), ("ttl_minutes", &ttl_minutes)];
+
+        let subject = self
+            .i18n_or(
+                "server.magic_link.email.login.subject",
+                &locale,
+                &login_args,
+            )
+            .await;
+        let text_body = self
+            .render_bilingual("server.magic_link.email.login.body", &locale, &login_args)
+            .await;
 
         let message = EmailMessage {
             to: user.email().to_string(),
@@ -496,6 +508,60 @@ impl MagicLinkInviteService {
         }
 
         Ok(())
+    }
+
+    /// Resolve a translation, falling back to the literal key on any
+    /// lookup error. Identical to the handler-side helper — kept inline
+    /// here because the service layer can't pull in a UI util module
+    /// without a circular dependency.
+    async fn i18n_or(&self, key: &str, locale: &Locale, args: &[(&str, &str)]) -> String {
+        self.i18n
+            .translate_args(key, Some(locale.clone()), args)
+            .await
+            .unwrap_or_else(|_| key.to_string())
+    }
+
+    /// Render an email body and, when the resolved locale isn't
+    /// English, append the English translation below a divider. This
+    /// is the "always readable" safety net: when locale inheritance
+    /// guesses wrong (PR 9 invitation flow) or `preferred_locale` is
+    /// stale, the recipient still has the English text to fall back
+    /// on. English-locale recipients get a single block — the partial
+    /// emits no divider in that case.
+    async fn render_bilingual(
+        &self,
+        body_key: &str,
+        locale: &Locale,
+        args: &[(&str, &str)],
+    ) -> String {
+        let body = self.i18n_or(body_key, locale, args).await;
+        let english_fallback = if locale.is_english() {
+            None
+        } else {
+            // Resolve the English copy through the same interpolation
+            // path so placeholder values are substituted identically.
+            // PR-A's English-fallback inside the I18nService means the
+            // resolution is reliable even if a translator hasn't
+            // populated the English copy yet — defensive default in
+            // both layers.
+            Some(self.i18n_or(body_key, &Locale::english(), args).await)
+        };
+        let divider = self
+            .i18n_or(
+                "server.magic_link.email.english_fallback_divider",
+                locale,
+                &[],
+            )
+            .await;
+        let template = BilingualEmailBody {
+            body: body.clone(),
+            divider,
+            english_fallback,
+        };
+        // `.render()` only fails on programmer error (template field
+        // out of sync). Fall back to the raw body so we still send
+        // *something* if the divider partial breaks.
+        template.render().unwrap_or(body)
     }
 
     /// Look up the resend-recipient hint for a token whose redemption
@@ -543,6 +609,20 @@ impl MagicLinkInviteService {
             masked_email,
         }))
     }
+}
+
+/// Plain-text email body wrapper: emits the localized text, then —
+/// only when the resolved locale isn't English — a divider plus the
+/// English copy. Lives next to the service rather than under
+/// `templates/` because the partial is just a few lines and being
+/// co-located keeps the relationship between rendering code and
+/// template obvious.
+#[derive(Template)]
+#[template(path = "magic_link/email_body.txt")]
+struct BilingualEmailBody {
+    body: String,
+    divider: String,
+    english_fallback: Option<String>,
 }
 
 /// Hint surfaced by the 410-Gone page to offer a one-click "send me a

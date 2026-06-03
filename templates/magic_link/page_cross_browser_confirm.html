@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="{{ locale_code }}">
+  <head>
+    <meta charset="utf-8">
+    <title>OxiCloud</title>
+    <style>
+      body { font-family: system-ui, sans-serif; max-width: 520px; margin: 6em auto;
+             padding: 0 1em; color: #333; line-height: 1.5; }
+      h1 { font-size: 1.4em; }
+      .btn { display: inline-block; padding: .7em 1.4em; background: #2563eb; color: #fff;
+             border-radius: 6px; text-decoration: none; font-weight: 600; margin-top: 1em; }
+      .btn:hover { background: #1d4ed8; }
+      .note { background: #fef3c7; border-left: 3px solid #f59e0b;
+              padding: .75em 1em; margin: 1.5em 0; border-radius: 4px; font-size: .95em; }
+    </style>
+  </head>
+  <body>
+    <h1>{{ title }}</h1>
+    <p>{{ body }}</p>
+    <p class="note">{{ warning }}</p>
+    <p><a class="btn" href="{{ confirm_url }}">{{ continue_label }}</a></p>
+  </body>
+</html>

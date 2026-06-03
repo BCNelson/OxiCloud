@@ -1017,6 +1017,7 @@ impl AppServiceFactory {
                     invite_magic_link_repo,
                     email_sender,
                     lifecycle,
+                    app_state.applications.i18n_service.clone(),
                     self.config.magic_link.clone(),
                     self.config.base_url(),
                 ),

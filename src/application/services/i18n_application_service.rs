@@ -28,6 +28,20 @@ impl I18nApplicationService {
             .await
     }
 
+    /// Get a translation with `{{name}}` substitution applied. Mirrors
+    /// the frontend convention so JSON values stay interchangeable.
+    /// `None` locale resolves to the server default (English).
+    pub async fn translate_args(
+        &self,
+        key: &str,
+        locale: Option<Locale>,
+        args: &[(&str, &str)],
+    ) -> I18nResult<String> {
+        self.i18n_service
+            .translate_args(key, locale.unwrap_or_default(), args)
+            .await
+    }
+
     /// Load translations for a locale
     pub async fn load_translations(&self, locale: Locale) -> I18nResult<()> {
         self.i18n_service.load_translations(locale).await
