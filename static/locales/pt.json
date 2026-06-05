@@ -20,7 +20,7 @@
             "email": {
                 "invitation": {
                     "subject": "{{inviter}} partilhou um {{kind}} consigo no OxiCloud",
-                    "body": "{{inviter}} partilhou um {{kind}} consigo no OxiCloud.\n\nAbra-o clicando no link abaixo:\n{{link}}\n\nO link é de uso único e expira em {{ttl_hours}} horas.\nSe não esperava este convite, pode ignorar esta mensagem.\n\n— OxiCloud"
+                    "body": "{{inviter_full}} partilhou um {{kind}} consigo no OxiCloud.\n\nAbra-o clicando no link abaixo:\n{{link}}\n\nO link é de uso único e expira em {{ttl_hours}} horas.\nSe não esperava este convite, pode ignorar esta mensagem.\n\n— OxiCloud"
                 },
                 "login": {
                     "subject": "Iniciar sessão no OxiCloud",
@@ -29,6 +29,12 @@
                 "kind_file": "ficheiro",
                 "kind_folder": "pasta",
                 "english_fallback_divider": "--- Versão em inglês abaixo ---"
+            }
+        },
+        "notification": {
+            "share": {
+                "subject": "{{inviter}} partilhou um {{kind}} consigo no OxiCloud",
+                "body": "{{inviter_full}} partilhou um {{kind}} consigo no OxiCloud.\n\nAbra o OxiCloud para ver a sua nova partilha:\n{{login_link}}\n\nPode ter mais partilhas novas de {{inviter}} — inicie sessão para ver todos os itens partilhados consigo.\n\n— OxiCloud\n\nRecebeu esta mensagem porque tem uma conta OxiCloud e a preferência de notificação de partilhas está ativada. Pode desativá-la no seu perfil (Avisar-me por e-mail quando alguém compartilhar comigo)."
             }
         }
     },
@@ -742,6 +748,8 @@
         "username_already_claimed": "Nome de usuário definido e não pode ser alterado (clientes DAV/NextCloud dependem dele).",
         "given_name": "Nome",
         "family_name": "Sobrenome",
+        "notify_on_share": "Avisar-me por e-mail quando alguém compartilhar comigo",
+        "notify_on_share_hint": "Quando desmarcado, os compartilhamentos continuarão aparecendo na sua conta — você apenas não receberá um e-mail sobre eles.",
         "save_profile": "Salvar alterações",
         "profile_saved": "Perfil atualizado",
         "profile_no_changes": "Sem alterações para salvar.",

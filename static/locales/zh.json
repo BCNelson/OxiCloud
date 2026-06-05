@@ -20,7 +20,7 @@
             "email": {
                 "invitation": {
                     "subject": "{{inviter}} 在 OxiCloud 上与您共享了一个{{kind}}",
-                    "body": "{{inviter}} 在 OxiCloud 上与您共享了一个{{kind}}。\n\n点击下方链接打开:\n{{link}}\n\n该链接仅可使用一次,并将在 {{ttl_hours}} 小时后过期。\n如果您未预期收到此邀请,可以忽略此消息。\n\n— OxiCloud"
+                    "body": "{{inviter_full}} 在 OxiCloud 上与您共享了一个{{kind}}。\n\n点击下方链接打开:\n{{link}}\n\n该链接仅可使用一次,并将在 {{ttl_hours}} 小时后过期。\n如果您未预期收到此邀请,可以忽略此消息。\n\n— OxiCloud"
                 },
                 "login": {
                     "subject": "登录 OxiCloud",
@@ -29,6 +29,12 @@
                 "kind_file": "文件",
                 "kind_folder": "文件夹",
                 "english_fallback_divider": "--- 以下为英文版本 ---"
+            }
+        },
+        "notification": {
+            "share": {
+                "subject": "{{inviter}} 在 OxiCloud 上与您共享了一个{{kind}}",
+                "body": "{{inviter_full}} 在 OxiCloud 上与您共享了一个{{kind}}。\n\n打开 OxiCloud 查看您的新共享:\n{{login_link}}\n\n您可能还有来自 {{inviter}} 的其他新共享 — 登录以查看所有共享给您的项目。\n\n— OxiCloud\n\n您收到此消息是因为您拥有 OxiCloud 账户且共享通知偏好已开启。您可以在个人资料中关闭它(当有人与我共享时通过电子邮件通知我)。"
             }
         }
     },
@@ -725,6 +731,8 @@
         "username_already_claimed": "用户名已设置,不可更改(DAV/NextCloud 客户端依赖它)。",
         "given_name": "名",
         "family_name": "姓",
+        "notify_on_share": "当有人与我共享时通过电子邮件通知我",
+        "notify_on_share_hint": "取消勾选后，共享项目仍会显示在您的账户中 — 只是不会收到相关邮件通知。",
         "save_profile": "保存更改",
         "profile_saved": "个人资料已更新",
         "profile_no_changes": "无更改可保存。",

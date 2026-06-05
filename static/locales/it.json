@@ -20,7 +20,7 @@
             "email": {
                 "invitation": {
                     "subject": "{{inviter}} ha condiviso un {{kind}} con te su OxiCloud",
-                    "body": "{{inviter}} ha condiviso un {{kind}} con te su OxiCloud.\n\nAprilo facendo clic sul link sottostante:\n{{link}}\n\nIl link è monouso e scade tra {{ttl_hours}} ore.\nSe non ti aspettavi questo invito, puoi ignorare questo messaggio.\n\n— OxiCloud"
+                    "body": "{{inviter_full}} ha condiviso un {{kind}} con te su OxiCloud.\n\nAprilo facendo clic sul link sottostante:\n{{link}}\n\nIl link è monouso e scade tra {{ttl_hours}} ore.\nSe non ti aspettavi questo invito, puoi ignorare questo messaggio.\n\n— OxiCloud"
                 },
                 "login": {
                     "subject": "Accedi a OxiCloud",
@@ -29,6 +29,12 @@
                 "kind_file": "file",
                 "kind_folder": "cartella",
                 "english_fallback_divider": "--- Versione inglese qui sotto ---"
+            }
+        },
+        "notification": {
+            "share": {
+                "subject": "{{inviter}} ha condiviso un {{kind}} con te su OxiCloud",
+                "body": "{{inviter_full}} ha condiviso un {{kind}} con te su OxiCloud.\n\nApri OxiCloud per vedere la tua nuova condivisione:\n{{login_link}}\n\nPotresti avere altre nuove condivisioni da {{inviter}} — accedi per vedere tutti gli elementi condivisi con te.\n\n— OxiCloud\n\nRicevi questo messaggio perché hai un account OxiCloud e la preferenza di notifica delle condivisioni è attiva. Puoi disattivarla dal tuo profilo (Avvisami via email quando qualcuno condivide con me)."
             }
         }
     },
@@ -742,6 +748,8 @@
         "username_already_claimed": "Nome utente impostato e non modificabile (i client DAV/NextCloud dipendono da esso).",
         "given_name": "Nome",
         "family_name": "Cognome",
+        "notify_on_share": "Avvisami via email quando qualcuno condivide con me",
+        "notify_on_share_hint": "Se deselezionato, le condivisioni continueranno ad apparire nel tuo account — semplicemente non riceverai un'email a riguardo.",
         "save_profile": "Salva modifiche",
         "profile_saved": "Profilo aggiornato",
         "profile_no_changes": "Nessuna modifica da salvare.",

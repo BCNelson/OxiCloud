@@ -20,7 +20,7 @@
             "email": {
                 "invitation": {
                     "subject": "{{inviter}} さんが OxiCloud で {{kind}} をあなたと共有しました",
-                    "body": "{{inviter}} さんが OxiCloud で {{kind}} をあなたと共有しました。\n\n以下のリンクをクリックして開いてください:\n{{link}}\n\nリンクは一度のみ有効で、{{ttl_hours}} 時間で期限切れになります。\nこの招待に心当たりがない場合は、このメッセージを無視していただいて結構です。\n\n— OxiCloud"
+                    "body": "{{inviter_full}} さんが OxiCloud で {{kind}} をあなたと共有しました。\n\n以下のリンクをクリックして開いてください:\n{{link}}\n\nリンクは一度のみ有効で、{{ttl_hours}} 時間で期限切れになります。\nこの招待に心当たりがない場合は、このメッセージを無視していただいて結構です。\n\n— OxiCloud"
                 },
                 "login": {
                     "subject": "OxiCloud にサインイン",
@@ -29,6 +29,12 @@
                 "kind_file": "ファイル",
                 "kind_folder": "フォルダー",
                 "english_fallback_divider": "--- 以下は英語版 ---"
+            }
+        },
+        "notification": {
+            "share": {
+                "subject": "{{inviter}} さんが OxiCloud で {{kind}} をあなたと共有しました",
+                "body": "{{inviter_full}} さんが OxiCloud で {{kind}} をあなたと共有しました。\n\n新しい共有を確認するには OxiCloud を開いてください:\n{{login_link}}\n\n{{inviter}} さんから他にも新しい共有があるかもしれません — サインインしてあなたと共有されたすべての項目を確認してください。\n\n— OxiCloud\n\nOxiCloud のアカウントをお持ちで、共有通知の設定が有効になっているため、このメッセージが届いています。プロフィールでオフにできます(誰かが共有したときにメールで通知する)。"
             }
         }
     },
@@ -742,6 +748,8 @@
         "username_already_claimed": "ユーザー名は設定済みで変更できません(DAV/NextCloudクライアントが依存します)。",
         "given_name": "名",
         "family_name": "姓",
+        "notify_on_share": "誰かが共有したときにメールで通知する",
+        "notify_on_share_hint": "チェックを外しても、共有はアカウントに表示されますが、メールでの通知は届きません。",
         "save_profile": "変更を保存",
         "profile_saved": "プロフィールを更新しました",
         "profile_no_changes": "保存する変更はありません。",

@@ -20,7 +20,7 @@
             "email": {
                 "invitation": {
                     "subject": "{{inviter}} udostępnił Ci {{kind}} w OxiCloud",
-                    "body": "{{inviter}} udostępnił Ci {{kind}} w OxiCloud.\n\nOtwórz, klikając poniższy link:\n{{link}}\n\nLink działa raz i wygasa za {{ttl_hours}} godzin.\nJeśli nie spodziewałeś się tego zaproszenia, możesz zignorować tę wiadomość.\n\n— OxiCloud"
+                    "body": "{{inviter_full}} udostępnił Ci {{kind}} w OxiCloud.\n\nOtwórz, klikając poniższy link:\n{{link}}\n\nLink działa raz i wygasa za {{ttl_hours}} godzin.\nJeśli nie spodziewałeś się tego zaproszenia, możesz zignorować tę wiadomość.\n\n— OxiCloud"
                 },
                 "login": {
                     "subject": "Zaloguj się do OxiCloud",
@@ -29,6 +29,12 @@
                 "kind_file": "plik",
                 "kind_folder": "folder",
                 "english_fallback_divider": "--- Wersja angielska poniżej ---"
+            }
+        },
+        "notification": {
+            "share": {
+                "subject": "{{inviter}} udostępnił Ci {{kind}} w OxiCloud",
+                "body": "{{inviter_full}} udostępnił Ci {{kind}} w OxiCloud.\n\nOtwórz OxiCloud, aby zobaczyć nowe udostępnienie:\n{{login_link}}\n\nMożesz mieć dodatkowe nowe udostępnienia od {{inviter}} — zaloguj się, aby zobaczyć wszystkie udostępnione Ci elementy.\n\n— OxiCloud\n\nOtrzymujesz tę wiadomość, ponieważ masz konto OxiCloud i preferencja powiadomień o udostępnieniach jest włączona. Możesz ją wyłączyć w swoim profilu (Wyślij mi e-mail, gdy ktoś coś mi udostępni)."
             }
         }
     },
@@ -742,6 +748,8 @@
         "username_already_claimed": "Nazwa użytkownika jest ustawiona i nie może być zmieniona (klienty DAV/NextCloud są od niej zależne).",
         "given_name": "Imię",
         "family_name": "Nazwisko",
+        "notify_on_share": "Wyślij mi e-mail, gdy ktoś coś mi udostępni",
+        "notify_on_share_hint": "Gdy odznaczone, udostępnienia nadal pojawiają się na Twoim koncie — po prostu nie otrzymasz o nich e-maila.",
         "save_profile": "Zapisz zmiany",
         "profile_saved": "Profil zaktualizowany",
         "profile_no_changes": "Brak zmian do zapisania.",

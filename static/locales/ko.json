@@ -20,7 +20,7 @@
             "email": {
                 "invitation": {
                     "subject": "{{inviter}}님이 OxiCloud에서 {{kind}}을(를) 공유했습니다",
-                    "body": "{{inviter}}님이 OxiCloud에서 {{kind}}을(를) 공유했습니다.\n\n아래 링크를 클릭하여 여세요:\n{{link}}\n\n링크는 한 번만 사용 가능하며 {{ttl_hours}}시간 후에 만료됩니다.\n이 초대를 예상하지 못했다면 이 메시지를 무시하셔도 됩니다.\n\n— OxiCloud"
+                    "body": "{{inviter_full}}님이 OxiCloud에서 {{kind}}을(를) 공유했습니다.\n\n아래 링크를 클릭하여 여세요:\n{{link}}\n\n링크는 한 번만 사용 가능하며 {{ttl_hours}}시간 후에 만료됩니다.\n이 초대를 예상하지 못했다면 이 메시지를 무시하셔도 됩니다.\n\n— OxiCloud"
                 },
                 "login": {
                     "subject": "OxiCloud 로그인",
@@ -29,6 +29,12 @@
                 "kind_file": "파일",
                 "kind_folder": "폴더",
                 "english_fallback_divider": "--- 영어 버전은 아래 ---"
+            }
+        },
+        "notification": {
+            "share": {
+                "subject": "{{inviter}}님이 OxiCloud에서 {{kind}}을(를) 공유했습니다",
+                "body": "{{inviter_full}}님이 OxiCloud에서 {{kind}}을(를) 공유했습니다.\n\n새 공유 항목을 확인하려면 OxiCloud를 여세요:\n{{login_link}}\n\n{{inviter}}님이 추가로 공유한 항목이 있을 수 있습니다 — 로그인하여 공유받은 모든 항목을 확인하세요.\n\n— OxiCloud\n\nOxiCloud 계정이 있고 공유 알림 기본 설정이 켜져 있어 이 메시지를 받았습니다. 프로필에서 끌 수 있습니다(다른 사람이 나에게 공유할 때 이메일로 알림 받기)."
             }
         }
     },
@@ -742,6 +748,8 @@
         "username_already_claimed": "사용자 이름이 설정되어 있어 변경할 수 없습니다(DAV/NextCloud 클라이언트가 이에 의존합니다).",
         "given_name": "이름",
         "family_name": "성",
+        "notify_on_share": "다른 사람이 나에게 공유할 때 이메일로 알림 받기",
+        "notify_on_share_hint": "선택을 해제해도 공유 항목은 계정에 계속 표시되지만, 이메일 알림은 받지 않습니다.",
         "save_profile": "변경 사항 저장",
         "profile_saved": "프로필이 업데이트되었습니다",
         "profile_no_changes": "저장할 변경 사항이 없습니다.",
