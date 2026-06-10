@@ -10,6 +10,7 @@ import { showConfirmDialog, ui } from '../../app/ui.js';
 import { getCsrfHeaders, getCsrfToken } from '../../core/csrf.js';
 import { i18n } from '../../core/i18n.js';
 import { notifications } from '../../core/notifications.js';
+import { invalidateFolderMeta } from '../../model/filesModel.js';
 import { triggerBrowserDownload } from '../../utils/download.js';
 
 /**
@@ -892,6 +893,8 @@ const fileOps = {
             });
 
             if (response.ok) {
+                // Parent changed — drop the cached breadcrumb metadata
+                invalidateFolderMeta(folderId);
                 // Reload files after moving
                 await loadFiles();
                 ui.showNotification('Folder moved', 'Folder moved successfully');
@@ -955,6 +958,8 @@ const fileOps = {
                 const data = await res.json();
                 success += data.stats?.successful || 0;
                 errors += data.stats?.failed || 0;
+                // Parents changed — drop the cached breadcrumb metadata
+                for (const id of folderIds) invalidateFolderMeta(id);
             }
         } catch (err) {
             console.error('Batch move error:', err);
@@ -1147,6 +1152,8 @@ const fileOps = {
             console.log('Response status:', response.status);
 
             if (response.ok) {
+                // Name changed — drop the cached breadcrumb metadata
+                invalidateFolderMeta(folderId);
                 ui.showNotification('Folder renamed', `Folder renamed to "${newName}"`);
             } else {
                 const errorText = await response.text();

@@ -438,9 +438,17 @@ async function loadFiles(options = { insertHistory: true }) {
             }
         }
 
-        await rebuildBreadCrumb();
-        ui.updateBreadcrumb();
-        updateHistory(options.insertHistory ?? true);
+        // Rebuild the breadcrumb concurrently with the first page fetch —
+        // the listing does not depend on it, and awaiting the ancestor
+        // chain first added one round-trip per depth level before the
+        // content even started loading. Crumbs, history and title update
+        // when it resolves (skipped when superseded by a newer navigation).
+        const requestedPath = app.currentPath;
+        const breadcrumbReady = rebuildBreadCrumb().then((committed) => {
+            if (!committed) return;
+            ui.updateBreadcrumb();
+            updateHistory(options.insertHistory ?? true);
+        });
 
         clearTimeout(spinnerTimeout);
 
@@ -457,6 +465,17 @@ async function loadFiles(options = { insertHistory: true }) {
         // Hand off to _loadPage (re-use cursor/groupBy state just reset above).
         _loading = false; // _loadPage sets its own guard
         await _loadPage({ isFirstPage: true });
+        await breadcrumbReady;
+
+        // rebuildBreadCrumb falls back to the home folder when the
+        // requested folder is inaccessible (deleted / permission revoked).
+        // The old sequential flow got the home listing for free; reload to
+        // match it.
+        if (app.currentPath !== requestedPath) {
+            ui.resetFilesList();
+            _nextCursor = null;
+            await _loadPage({ isFirstPage: true });
+        }
 
         // Deep-link: open a specific file if requested via app.viewFile.
         // We don't have a flat file list anymore (cursor pages), so only try
