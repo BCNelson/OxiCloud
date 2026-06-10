@@ -9,7 +9,7 @@ use quick_xml::{
     Writer,
     events::{BytesEnd, BytesStart, BytesText, Event},
 };
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::application::adapters::webdav_adapter::{PropFindRequest, WebDavAdapter};
@@ -1001,6 +1001,26 @@ async fn write_nc_multistatus<W: std::io::Write>(
     file_id_svc: Option<&Arc<NextcloudFileIdService>>,
     favorite_ids: &HashSet<String>,
 ) -> Result<(), String> {
+    // When folder is None, files are the target resource itself (single-file
+    // PROPFIND) and must always be emitted. When folder is Some, files/subfolders
+    // are children and should only be listed when depth > 0.
+    let emit_children = folder.is_none() || depth != "0";
+
+    // Pre-resolve every oc:fileid up front in two batch queries (one per
+    // object type) instead of one INSERT round-trip per child. The XML writing
+    // below is then a pure synchronous map lookup.
+    let mut file_uuids: Vec<String> = Vec::new();
+    let mut folder_uuids: Vec<String> = Vec::new();
+    if let Some(f) = folder {
+        folder_uuids.push(f.id.clone());
+    }
+    if emit_children {
+        file_uuids.extend(files.iter().map(|f| f.id.clone()));
+        folder_uuids.extend(subfolders.iter().map(|sf| sf.id.clone()));
+    }
+    let (file_id_map, folder_id_map) =
+        batch_resolve_ids(file_id_svc, &file_uuids, &folder_uuids).await;
+
     let mut xml = Writer::new(writer);
 
     // Root element with all required namespaces.
@@ -1015,7 +1035,7 @@ async fn write_nc_multistatus<W: std::io::Write>(
     // §5.2 + strict NC-client enforcement — see `nc_collection_href`).
     if let Some(f) = folder {
         let href = nc_collection_href(username, subpath);
-        let file_id = resolve_folder_id(file_id_svc, &f.id).await;
+        let file_id = folder_id_map.get(&f.id).copied();
         let oc_id = file_id.map(|id| format_oc_id(id, file_id_svc));
         write_folder_response(
             &mut xml,
@@ -1027,11 +1047,6 @@ async fn write_nc_multistatus<W: std::io::Write>(
             favorite_ids,
         )?;
     }
-
-    // When folder is None, files are the target resource itself (single-file
-    // PROPFIND) and must always be emitted. When folder is Some, files/subfolders
-    // are children and should only be listed when depth > 0.
-    let emit_children = folder.is_none() || depth != "0";
 
     if emit_children {
         // Files.
@@ -1045,7 +1060,7 @@ async fn write_nc_multistatus<W: std::io::Write>(
                 format!("{}/{}", subpath.trim_end_matches('/'), file.name)
             };
             let href = nc_href(username, &child_sub);
-            let file_id = resolve_file_id(file_id_svc, &file.id).await;
+            let file_id = file_id_map.get(&file.id).copied();
             let oc_id = file_id.map(|id| format_oc_id(id, file_id_svc));
             write_file_response(
                 &mut xml,
@@ -1066,7 +1081,7 @@ async fn write_nc_multistatus<W: std::io::Write>(
                 format!("{}/{}", subpath.trim_end_matches('/'), sf.name)
             };
             let href = nc_collection_href(username, &child_sub);
-            let file_id = resolve_folder_id(file_id_svc, &sf.id).await;
+            let file_id = folder_id_map.get(&sf.id).copied();
             let oc_id = file_id.map(|id| format_oc_id(id, file_id_svc));
             write_folder_response(
                 &mut xml,
@@ -1273,20 +1288,24 @@ pub fn write_text_element<W: std::io::Write>(
     Ok(())
 }
 
-pub async fn resolve_file_id(
+/// Resolve every `oc:fileid` for a listing in two batch queries (one per
+/// object type) instead of one INSERT round-trip per child. Returns
+/// `(file_map, folder_map)` keyed by object UUID; entries are absent when the
+/// service is disabled or an id can't be resolved, mirroring the previous
+/// per-call `Option` behaviour. The two batches run concurrently.
+pub async fn batch_resolve_ids(
     svc: Option<&Arc<NextcloudFileIdService>>,
-    file_uuid: &str,
-) -> Option<i64> {
-    let svc = svc?;
-    svc.get_or_create_file_id(file_uuid).await.ok()
-}
-
-pub async fn resolve_folder_id(
-    svc: Option<&Arc<NextcloudFileIdService>>,
-    folder_uuid: &str,
-) -> Option<i64> {
-    let svc = svc?;
-    svc.get_or_create_folder_id(folder_uuid).await.ok()
+    file_uuids: &[String],
+    folder_uuids: &[String],
+) -> (HashMap<String, i64>, HashMap<String, i64>) {
+    let Some(svc) = svc else {
+        return (HashMap::new(), HashMap::new());
+    };
+    let (files, folders) = tokio::join!(
+        svc.get_or_create_file_ids(file_uuids),
+        svc.get_or_create_folder_ids(folder_uuids),
+    );
+    (files.unwrap_or_default(), folders.unwrap_or_default())
 }
 
 pub fn format_oc_id(id: i64, svc: Option<&Arc<NextcloudFileIdService>>) -> String {
