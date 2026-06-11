@@ -12,7 +12,7 @@
 #        6 wrong attempts from spoofed X-Forwarded-For: IP1
 #        lock (admin, IP1), but the SAME correct credential
 #        from spoofed X-Forwarded-For: IP2 still succeeds.
-#        Depends on OXICLOUD_TRUST_PROXY_HEADERS=true in
+#        Depends on OXICLOUD_TRUST_PROXY_CIDR=0.0.0.0/0 in
 #        tests/common/server.env so the server honours the
 #        X-Forwarded-For header on localhost.
 #
@@ -191,7 +191,7 @@ header "WWW-Authenticate" contains "Basic"
 # (admin, 10.0.0.2 — released by the success), neither of
 # which any other test touches.
 #
-# Requires: OXICLOUD_TRUST_PROXY_HEADERS=true in
+# Requires: OXICLOUD_TRUST_PROXY_CIDR=0.0.0.0/0 in
 # tests/common/server.env.
 # ─────────────────────────────────────────────────────────────
 
