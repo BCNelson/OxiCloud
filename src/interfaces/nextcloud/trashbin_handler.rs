@@ -14,7 +14,6 @@ use crate::application::ports::folder_ports::FolderUseCase;
 use crate::application::ports::trash_ports::TrashUseCase;
 use crate::common::di::AppState;
 use crate::interfaces::errors::AppError;
-use crate::interfaces::middleware::auth::{AuthUser, CurrentUser};
 use crate::interfaces::nextcloud::webdav_handler::{
     batch_resolve_ids, extract_nc_subpath_from_dest, format_oc_id, nc_to_internal_path,
     write_text_element,
@@ -28,7 +27,7 @@ const HEADER_DAV: HeaderName = HeaderName::from_static("dav");
 pub async fn handle_nc_trashbin(
     state: Arc<AppState>,
     req: Request<Body>,
-    user: AuthUser,
+    session: crate::interfaces::nextcloud::session::NcSession,
     subpath: String,
 ) -> Result<Response<Body>, AppError> {
     let method = req.method().clone();
@@ -37,21 +36,25 @@ pub async fn handle_nc_trashbin(
     match method.as_str() {
         "OPTIONS" => handle_options(),
         "PROPFIND" if subpath_trimmed == "trash" || subpath_trimmed.is_empty() => {
-            handle_propfind(state, &user).await
+            handle_propfind(state, &session).await
         }
         "MOVE" if subpath_trimmed.starts_with("trash/") => {
+            // Keep the destination-collision-check feature added on HEAD
+            // (RFC 4918 §9.9.4: refuse restore with 412 when the
+            // destination is taken by a live resource). The chroot lookup
+            // moves into `handle_restore` via the session.
             let dest_header = req
                 .headers()
                 .get("destination")
                 .and_then(|v| v.to_str().ok())
                 .map(|s| s.to_string());
-            handle_restore(state, dest_header, &user, subpath_trimmed).await
+            handle_restore(state, dest_header, &session, subpath_trimmed).await
         }
         "DELETE" if subpath_trimmed == "trash" || subpath_trimmed.is_empty() => {
-            handle_empty_trash(state, &user).await
+            handle_empty_trash(state, &session).await
         }
         "DELETE" if subpath_trimmed.starts_with("trash/") => {
-            handle_delete_permanent(state, &user, subpath_trimmed).await
+            handle_delete_permanent(state, &session, subpath_trimmed).await
         }
         _ => Ok(Response::builder()
             .status(StatusCode::METHOD_NOT_ALLOWED)
@@ -75,8 +78,9 @@ fn handle_options() -> Result<Response<Body>, AppError> {
 
 async fn handle_propfind(
     state: Arc<AppState>,
-    user: &CurrentUser,
+    session: &crate::interfaces::nextcloud::session::NcSession,
 ) -> Result<Response<Body>, AppError> {
+    let user = &session.user;
     let trash_svc = state
         .trash_service
         .as_ref()
@@ -107,9 +111,11 @@ async fn handle_propfind(
 async fn handle_restore(
     state: Arc<AppState>,
     dest_header: Option<String>,
-    user: &CurrentUser,
+    session: &crate::interfaces::nextcloud::session::NcSession,
     subpath: &str,
 ) -> Result<Response<Body>, AppError> {
+    let user = &session.user;
+    let chroot = session.require_chroot()?;
     let id = extract_trash_id(subpath)?;
 
     let trash_svc = state
@@ -128,7 +134,7 @@ async fn handle_restore(
     if let Some(dest_header) = dest_header
         && let Some(dest_subpath) = extract_nc_subpath_from_dest(&dest_header, &user.username)
     {
-        let dest_internal = nc_to_internal_path(&user.username, &dest_subpath)?;
+        let dest_internal = nc_to_internal_path(chroot, &dest_subpath)?;
         let folder_service = &state.applications.folder_service;
         let file_service = &state.applications.file_retrieval_service;
         let dest_taken = file_service.get_file_by_path(&dest_internal).await.is_ok()
@@ -184,8 +190,9 @@ async fn handle_restore(
 
 async fn handle_empty_trash(
     state: Arc<AppState>,
-    user: &CurrentUser,
+    session: &crate::interfaces::nextcloud::session::NcSession,
 ) -> Result<Response<Body>, AppError> {
+    let user = &session.user;
     let trash_svc = state
         .trash_service
         .as_ref()
@@ -206,9 +213,10 @@ async fn handle_empty_trash(
 
 async fn handle_delete_permanent(
     state: Arc<AppState>,
-    user: &CurrentUser,
+    session: &crate::interfaces::nextcloud::session::NcSession,
     subpath: &str,
 ) -> Result<Response<Body>, AppError> {
+    let user = &session.user;
     let id = extract_trash_id(subpath)?;
 
     let trash_svc = state

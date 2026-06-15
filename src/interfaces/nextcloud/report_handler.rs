@@ -22,7 +22,6 @@ use crate::application::ports::inbound::SearchUseCase;
 use crate::common::di::AppState;
 use crate::domain::entities::file::File;
 use crate::interfaces::errors::AppError;
-use crate::interfaces::middleware::auth::CurrentUser;
 use crate::interfaces::nextcloud::webdav_handler::{
     batch_resolve_ids, format_oc_id, nc_href, write_file_response, write_folder_response,
 };
@@ -35,7 +34,7 @@ use crate::interfaces::nextcloud::webdav_handler::{
 pub async fn handle_nc_report(
     state: Arc<AppState>,
     req: Request<Body>,
-    user: &CurrentUser,
+    session: &crate::interfaces::nextcloud::session::NcSession,
     _subpath: &str,
 ) -> Result<Response<Body>, AppError> {
     let body_bytes = body::to_bytes(req.into_body(), 64 * 1024)
@@ -45,9 +44,9 @@ pub async fn handle_nc_report(
     let body_str = String::from_utf8_lossy(&body_bytes);
 
     if body_str.contains("filter-files") {
-        handle_filter_files(state, &body_str, user).await
+        handle_filter_files(state, &body_str, session).await
     } else if body_str.contains("searchrequest") {
-        handle_search(state, &body_str, user).await
+        handle_search(state, &body_str, session).await
     } else {
         // Unknown REPORT type -- return empty multistatus.
         Ok(empty_multistatus())
@@ -59,8 +58,10 @@ pub async fn handle_nc_report(
 async fn handle_filter_files(
     state: Arc<AppState>,
     _body: &str,
-    user: &CurrentUser,
+    session: &crate::interfaces::nextcloud::session::NcSession,
 ) -> Result<Response<Body>, AppError> {
+    let user = &session.user;
+    let url_user = &session.raw_username;
     let fav_svc = match state.favorites_service.as_ref() {
         Some(svc) => svc,
         None => return Ok(empty_multistatus()),
@@ -149,9 +150,13 @@ async fn handle_filter_files(
 
         write_multistatus_start(&mut xml)?;
 
+        // Keep main's batched-resolution structure (one batch query
+        // per type, not 2N round-trips). Hrefs use `url_user` so the
+        // multi-drive `~{drive}` form is echoed back to the client;
+        // owner-id stays canonical via `&user.username`.
         for file in &files {
             let subpath = strip_home_prefix(&file.path, home_prefix);
-            let href = nc_href(&user.username, subpath);
+            let href = nc_href(url_user, subpath);
             let fid = file_id_map.get(&file.id).copied();
             let oc_id = fid.map(|id| format_oc_id(id, file_id_svc));
             write_file_response(
@@ -168,7 +173,7 @@ async fn handle_filter_files(
 
         for folder in &folders {
             let subpath = strip_home_prefix(&folder.path, home_prefix);
-            let href = format!("{}/", nc_href(&user.username, subpath));
+            let href = format!("{}/", nc_href(url_user, subpath));
             let fid = folder_id_map.get(&folder.id).copied();
             let oc_id = fid.map(|id| format_oc_id(id, file_id_svc));
             write_folder_response(
@@ -199,8 +204,13 @@ async fn handle_filter_files(
 async fn handle_search(
     state: Arc<AppState>,
     body: &str,
-    user: &CurrentUser,
+    session: &crate::interfaces::nextcloud::session::NcSession,
 ) -> Result<Response<Body>, AppError> {
+    let user = &session.user;
+    // Validate chroot up-front (path-scoped handler); `resolve_scope_folder`
+    // below re-pulls it from the session for the path-mapping step.
+    session.require_chroot()?;
+    let url_user = &session.raw_username;
     let search_svc = match state.applications.search_service.as_ref() {
         Some(svc) => svc,
         None => return Ok(empty_multistatus()),
@@ -214,7 +224,7 @@ async fn handle_search(
     let nresults = parse_nresults(body).unwrap_or(100);
 
     // Resolve folder scope from <d:href> inside <d:scope>.
-    let folder_id = resolve_scope_folder(&state, body, &user.username, user.id).await;
+    let folder_id = resolve_scope_folder(&state, body, session).await;
 
     let criteria = SearchCriteriaDto {
         name_contains: Some(term),
@@ -257,7 +267,7 @@ async fn handle_search(
         // Files.
         for file in &files {
             let subpath = strip_home_prefix(&file.path, home_prefix);
-            let href = nc_href(&user.username, subpath);
+            let href = nc_href(url_user, subpath);
             let fid = file_id_map.get(&file.id).copied();
             let oc_id = fid.map(|id| format_oc_id(id, file_id_svc));
             write_file_response(
@@ -275,7 +285,7 @@ async fn handle_search(
         // Folders.
         for folder in &folders {
             let subpath = strip_home_prefix(&folder.path, home_prefix);
-            let href = format!("{}/", nc_href(&user.username, subpath));
+            let href = format!("{}/", nc_href(url_user, subpath));
             let fid = folder_id_map.get(&folder.id).copied();
             let oc_id = fid.map(|id| format_oc_id(id, file_id_svc));
             write_folder_response(
@@ -468,28 +478,40 @@ fn xml_extract_text(body: &str, local_name: &[u8]) -> Option<String> {
 }
 
 /// Resolve a scope href (e.g. `/files/username/Documents`) to a folder ID.
+///
+/// Pulls everything it needs from the `NcSession`: the caller's id (so
+/// `get_folder_by_path` can be user-scoped — post-D0 paths like
+/// `Personal/Docs` are not globally unique), the chroot (provides the
+/// path prefix that `nc_to_internal_path` prepends), and the raw wire
+/// `{user}` segment (bare or `admin~{uuid}`) so we strip the prefix the
+/// NC client actually sent.
 async fn resolve_scope_folder(
     state: &AppState,
     body: &str,
-    username: &str,
-    user_id: uuid::Uuid,
+    session: &crate::interfaces::nextcloud::session::NcSession,
 ) -> Option<String> {
+    let user = &session.user;
+    let chroot = session.require_chroot().ok()?;
+    let url_user = &session.raw_username;
     let href = parse_scope_href(body)?;
 
-    // The href is typically `/files/{user}/subpath` or `/remote.php/dav/files/{user}/subpath`.
-    let subpath = extract_subpath_from_scope(&href, username)?;
+    // The href is typically `/files/{url_user}/subpath` or
+    // `/remote.php/dav/files/{url_user}/subpath`. On a multi-drive
+    // session the `{url_user}` segment carries the `~{uuid}` marker,
+    // so we strip with the composite to find the real subpath. Using
+    // `user.username` here would fail to match for non-home drives.
+    let subpath = extract_subpath_from_scope(&href, url_user)?;
     if subpath.is_empty() {
         // Root scope -- no folder_id filter needed.
         return None;
     }
 
     let internal_path =
-        crate::interfaces::nextcloud::webdav_handler::nc_to_internal_path(username, &subpath)
-            .ok()?;
+        crate::interfaces::nextcloud::webdav_handler::nc_to_internal_path(chroot, &subpath).ok()?;
 
     let folder_service = &state.applications.folder_service;
     folder_service
-        .get_folder_by_path(&internal_path, user_id)
+        .get_folder_by_path(&internal_path, user.id)
         .await
         .ok()
         .map(|f| f.id)
@@ -498,13 +520,16 @@ async fn resolve_scope_folder(
 /// Extract the subpath portion from a scope href.
 ///
 /// Handles both short form `/files/{user}/sub` and full
-/// `/remote.php/dav/files/{user}/sub`.
-fn extract_subpath_from_scope(href: &str, username: &str) -> Option<String> {
+/// `/remote.php/dav/files/{user}/sub`. `url_user` is the literal URL
+/// `{user}` segment — bare for legacy single-drive sync, composite
+/// `admin~{uuid}` for multi-drive — so this matches whichever shape
+/// the NC client actually sent.
+fn extract_subpath_from_scope(href: &str, url_user: &str) -> Option<String> {
     let patterns = [
-        format!("/remote.php/dav/files/{}/", username),
-        format!("/files/{}/", username),
-        format!("/remote.php/dav/files/{}", username),
-        format!("/files/{}", username),
+        format!("/remote.php/dav/files/{}/", url_user),
+        format!("/files/{}/", url_user),
+        format!("/remote.php/dav/files/{}", url_user),
+        format!("/files/{}", url_user),
     ];
 
     for pat in &patterns {
