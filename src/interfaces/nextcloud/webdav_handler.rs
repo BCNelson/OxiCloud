@@ -381,10 +381,18 @@ async fn handle_head(
     // ETag comes from `FileDto::etag` — see the same comment block on
     // the GET handler. HEAD and GET must agree byte-for-byte; pulling
     // both from the same DTO field guarantees that.
+    //
+    // We deliberately do NOT set `Content-Length: file.size` here even
+    // though RFC 7231 §4.3.2 says HEAD SHOULD return the same headers
+    // GET would. Our body is `Body::empty()`, so declaring a non-zero
+    // Content-Length tells the client "20 bytes are coming" — and on a
+    // keep-alive connection the client waits forever for them. Hyper
+    // derives `Content-Length: 0` from the empty body, which is honest
+    // about what's actually on the wire. Clients that need the file
+    // size use PROPFIND (which is what NC and Sabre clients do).
     Ok(Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, file.mime_type.as_ref())
-        .header(header::CONTENT_LENGTH, file.size)
         .header(header::ETAG, format!("\"{}\"", file.etag))
         .header(header::LAST_MODIFIED, modified_at.to_rfc2822())
         .body(Body::empty())
