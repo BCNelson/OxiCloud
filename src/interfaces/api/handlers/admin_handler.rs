@@ -1,17 +1,25 @@
 use axum::{
     Router,
-    extract::{Json, Path, Query, State},
+    extract::{DefaultBodyLimit, Json, Multipart, Path, Query, State},
     http::{HeaderMap, StatusCode},
-    response::IntoResponse,
+    response::{
+        IntoResponse,
+        sse::{Event, KeepAlive, Sse},
+    },
     routing::{delete, get, post, put},
 };
 
+use crate::application::dtos::plugin_dto::{
+    PluginInfoDto, PluginLogEntryDto, PluginLogPageDto, PluginLogQueryDto, PluginRetentionDto,
+    SetEnabledDto,
+};
 use crate::application::dtos::settings_dto::{
     AdminCreateUserDto, AdminResetPasswordDto, DashboardStatsDto, ListUsersQueryDto,
     MigrationStateDto, SaveOidcSettingsDto, SaveStorageSettingsDto, SendSmtpTestDto, SmtpInfoDto,
     SmtpTestResultDto, StartMigrationDto, TestOidcConnectionDto, TestStorageConnectionDto,
     UpdateUserActiveDto, UpdateUserQuotaDto, UpdateUserRoleDto, VerifyMigrationDto,
 };
+use crate::application::ports::plugin_ports::{LogQuery, PluginManagementPort, PluginMgmtError};
 use crate::common::di::AppState;
 use crate::interfaces::errors::AppError;
 use crate::interfaces::middleware::admin::require_admin;
@@ -60,6 +68,23 @@ pub fn admin_routes() -> Router<Arc<AppState>> {
         .route("/audio/metadata/reextract", post(reextract_audio_metadata))
         // Image/video capture metadata (Photos timeline backfill)
         .route("/photos/metadata/reextract", post(reextract_image_metadata))
+        // Plugin management
+        .route("/plugins", get(list_plugins))
+        // Install caps the request body at 32 MiB (overriding the global
+        // multi-GB upload limit) — a plugin bundle is small; the unpack also
+        // enforces a 64 MiB decompressed ceiling.
+        .route(
+            "/plugins",
+            post(install_plugin).layer(DefaultBodyLimit::max(32 * 1024 * 1024)),
+        )
+        .route("/plugins/{id}/enabled", put(set_plugin_enabled))
+        .route("/plugins/{id}", delete(delete_plugin))
+        // Plugin logs + per-plugin retention
+        .route("/plugins/{id}/logs", get(get_plugin_logs))
+        .route("/plugins/{id}/logs", delete(clear_plugin_logs))
+        .route("/plugins/{id}/logs/stream", get(stream_plugin_logs))
+        .route("/plugins/{id}/retention", get(get_plugin_retention))
+        .route("/plugins/{id}/retention", put(set_plugin_retention))
         // SMTP diagnostics
         .route("/smtp/info", get(get_smtp_info))
         .route("/smtp/test", post(send_smtp_test))
@@ -1439,4 +1464,315 @@ async fn send_smtp_test(
     };
 
     Ok(Json(result))
+}
+
+// ---- Plugin management -----------------------------------------------------
+
+/// Resolve the plugin-management port, or 503 when plugins are compiled out or
+/// disabled via `OXICLOUD_ENABLE_PLUGINS`. The admin UI treats this 503 as the
+/// "plugins disabled" state rather than an error.
+fn plugin_mgmt(state: &AppState) -> Result<&Arc<dyn PluginManagementPort>, AppError> {
+    state.plugin_management.as_ref().ok_or_else(|| {
+        AppError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Plugins are disabled",
+            "PluginsDisabled",
+        )
+    })
+}
+
+/// Map a management-layer error to an HTTP error. NotFound → 404, IdExists →
+/// 409, Rejected → 400 (with the stable reason key in the message), Io → 500.
+fn map_mgmt_err(err: &PluginMgmtError) -> AppError {
+    match err {
+        PluginMgmtError::NotFound => AppError::not_found("Plugin not found"),
+        PluginMgmtError::IdExists => {
+            AppError::conflict("A plugin with this id is already installed")
+        }
+        PluginMgmtError::Rejected(reason) => AppError::new(
+            StatusCode::BAD_REQUEST,
+            format!("Plugin rejected: {reason}"),
+            "PluginRejected",
+        ),
+        PluginMgmtError::Io(msg) => {
+            AppError::internal_error(format!("Plugin operation failed: {msg}"))
+        }
+    }
+}
+
+/// GET /api/admin/plugins — list installed plugins.
+pub async fn list_plugins(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, AppError> {
+    admin_guard(&state, &headers).await?;
+    let mgmt = plugin_mgmt(&state)?;
+    let plugins: Vec<PluginInfoDto> = mgmt.list().into_iter().map(PluginInfoDto::from).collect();
+    // `enabled` reports that the plugin *subsystem* is active (reaching here
+    // means it is — `plugin_mgmt` returns 503 otherwise, which the UI reads as
+    // the disabled state). Per-plugin enablement is each entry's own `enabled`.
+    Ok((
+        StatusCode::OK,
+        Json(serde_json::json!({ "enabled": true, "plugins": plugins })),
+    ))
+}
+
+/// PUT /api/admin/plugins/{id}/enabled — enable or disable a plugin.
+pub async fn set_plugin_enabled(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(dto): Json<SetEnabledDto>,
+) -> Result<impl IntoResponse, AppError> {
+    let (admin_id, _) = admin_guard(&state, &headers).await?;
+    let mgmt = plugin_mgmt(&state)?;
+    mgmt.set_enabled(&id, dto.enabled)
+        .map_err(|e| map_mgmt_err(&e))?;
+
+    if dto.enabled {
+        tracing::info!(
+            target: "audit",
+            event = "plugin.enabled",
+            plugin_id = %id,
+            admin_id = %admin_id,
+            "👮🏻‍♂️ plugin enabled by admin"
+        );
+    } else {
+        tracing::info!(
+            target: "audit",
+            event = "plugin.disabled",
+            plugin_id = %id,
+            admin_id = %admin_id,
+            "👮🏻‍♂️ plugin disabled by admin"
+        );
+    }
+
+    Ok((
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "message": if dto.enabled { "Plugin enabled" } else { "Plugin disabled" },
+            "id": id,
+            "enabled": dto.enabled,
+        })),
+    ))
+}
+
+/// POST /api/admin/plugins — install a plugin from a multipart body with a
+/// single `bundle` part: a `.zip` containing `plugin.toml` and its `.wasm`.
+pub async fn install_plugin(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    mut multipart: Multipart,
+) -> Result<impl IntoResponse, AppError> {
+    let (admin_id, _) = admin_guard(&state, &headers).await?;
+    let mgmt = plugin_mgmt(&state)?;
+
+    let mut bundle: Option<Vec<u8>> = None;
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|e| AppError::bad_request(format!("Invalid multipart body: {e}")))?
+    {
+        if field.name() == Some("bundle") {
+            bundle = Some(
+                field
+                    .bytes()
+                    .await
+                    .map_err(|e| AppError::bad_request(format!("Invalid bundle part: {e}")))?
+                    .to_vec(),
+            );
+        }
+    }
+
+    let bundle = match bundle {
+        Some(b) => b,
+        None => {
+            tracing::warn!(
+                target: "audit",
+                event = "plugin.install_rejected",
+                reason = "missing_part",
+                admin_id = %admin_id,
+                "👮🏻‍♂️ plugin install rejected: missing 'bundle' part"
+            );
+            return Err(AppError::bad_request("A 'bundle' (.zip) part is required"));
+        }
+    };
+
+    match mgmt.install_bundle(bundle) {
+        Ok(info) => {
+            tracing::info!(
+                target: "audit",
+                event = "plugin.installed",
+                plugin_id = %info.id,
+                admin_id = %admin_id,
+                "👮🏻‍♂️ plugin installed by admin"
+            );
+            Ok((StatusCode::CREATED, Json(PluginInfoDto::from(info))))
+        }
+        Err(e) => {
+            tracing::warn!(
+                target: "audit",
+                event = "plugin.install_rejected",
+                reason = e.reason(),
+                admin_id = %admin_id,
+                "👮🏻‍♂️ plugin install rejected"
+            );
+            Err(map_mgmt_err(&e))
+        }
+    }
+}
+
+/// DELETE /api/admin/plugins/{id} — uninstall a plugin and delete its files.
+pub async fn delete_plugin(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, AppError> {
+    let (admin_id, _) = admin_guard(&state, &headers).await?;
+    let mgmt = plugin_mgmt(&state)?;
+    mgmt.remove(&id).map_err(|e| map_mgmt_err(&e))?;
+
+    tracing::info!(
+        target: "audit",
+        event = "plugin.removed",
+        plugin_id = %id,
+        admin_id = %admin_id,
+        "👮🏻‍♂️ plugin removed by admin"
+    );
+
+    Ok((
+        StatusCode::OK,
+        Json(serde_json::json!({ "message": "Plugin removed", "id": id })),
+    ))
+}
+
+/// GET /api/admin/plugins/{id}/logs — a filtered, paginated page of a plugin's
+/// structured log entries (newest first).
+pub async fn get_plugin_logs(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Query(q): Query<PluginLogQueryDto>,
+) -> Result<impl IntoResponse, AppError> {
+    admin_guard(&state, &headers).await?;
+    let mgmt = plugin_mgmt(&state)?;
+
+    let limit = q.limit.unwrap_or(50).clamp(1, 500);
+    let offset = q.offset.unwrap_or(0);
+    let page = mgmt
+        .read_logs(
+            &id,
+            LogQuery {
+                level: q.level,
+                search: q.search,
+                offset,
+                limit,
+            },
+        )
+        .await
+        .map_err(|e| map_mgmt_err(&e))?;
+
+    Ok(Json(PluginLogPageDto::from_page(page, limit, offset)))
+}
+
+/// DELETE /api/admin/plugins/{id}/logs — wipe a plugin's persisted logs.
+pub async fn clear_plugin_logs(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, AppError> {
+    let (admin_id, _) = admin_guard(&state, &headers).await?;
+    let mgmt = plugin_mgmt(&state)?;
+    mgmt.clear_logs(&id).await.map_err(|e| map_mgmt_err(&e))?;
+
+    tracing::info!(
+        target: "audit",
+        event = "plugin.logs_cleared",
+        plugin_id = %id,
+        admin_id = %admin_id,
+        "👮🏻‍♂️ plugin logs cleared by admin"
+    );
+
+    Ok((
+        StatusCode::OK,
+        Json(serde_json::json!({ "message": "Plugin logs cleared", "id": id })),
+    ))
+}
+
+/// GET /api/admin/plugins/{id}/logs/stream — Server-Sent Events live tail. Each
+/// `message` event carries one new log entry (JSON); a `lagged` event signals
+/// the client should resync after falling behind. Auth rides the access cookie,
+/// so `EventSource` works without setting headers.
+pub async fn stream_plugin_logs(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, AppError> {
+    use tokio_stream::StreamExt;
+    use tokio_stream::wrappers::{BroadcastStream, errors::BroadcastStreamRecvError};
+
+    admin_guard(&state, &headers).await?;
+    let mgmt = plugin_mgmt(&state)?;
+    if !mgmt.list().iter().any(|p| p.id == id) {
+        return Err(AppError::not_found("Plugin not found"));
+    }
+
+    let rx = mgmt.subscribe_logs();
+    let want = id;
+    let stream = BroadcastStream::new(rx).filter_map(move |res| match res {
+        Ok(ev) if ev.plugin_id == want => {
+            let dto = PluginLogEntryDto::from(ev.entry);
+            let event = Event::default()
+                .json_data(&dto)
+                .unwrap_or_else(|_| Event::default().comment("serialize error"));
+            Some(Ok::<Event, std::convert::Infallible>(event))
+        }
+        Ok(_) => None,
+        Err(BroadcastStreamRecvError::Lagged(n)) => {
+            Some(Ok(Event::default().event("lagged").data(n.to_string())))
+        }
+    });
+
+    Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
+}
+
+/// GET /api/admin/plugins/{id}/retention — the plugin's effective retention.
+pub async fn get_plugin_retention(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<impl IntoResponse, AppError> {
+    admin_guard(&state, &headers).await?;
+    let mgmt = plugin_mgmt(&state)?;
+    let settings = mgmt
+        .get_retention(&id)
+        .await
+        .map_err(|e| map_mgmt_err(&e))?;
+    Ok(Json(PluginRetentionDto::from(settings)))
+}
+
+/// PUT /api/admin/plugins/{id}/retention — set the plugin's retention policy.
+pub async fn set_plugin_retention(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(dto): Json<PluginRetentionDto>,
+) -> Result<impl IntoResponse, AppError> {
+    let (admin_id, _) = admin_guard(&state, &headers).await?;
+    let mgmt = plugin_mgmt(&state)?;
+    mgmt.set_retention(&id, dto.into())
+        .await
+        .map_err(|e| map_mgmt_err(&e))?;
+
+    tracing::info!(
+        target: "audit",
+        event = "plugin.retention_updated",
+        plugin_id = %id,
+        admin_id = %admin_id,
+        retention_days = dto.retention_days,
+        max_bytes = dto.max_bytes,
+        "👮🏻‍♂️ plugin log retention updated by admin"
+    );
+
+    Ok((StatusCode::OK, Json(dto)))
 }

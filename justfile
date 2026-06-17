@@ -65,6 +65,26 @@ wasm-check:
 wasm-test:
     cd wasm/oxicloud-hash; cargo test --release
 
+# Run the host plugin-runtime tests (compiles the Extism/wasmtime runtime).
+test-plugins:
+    cargo test --features plugins
+
+# Rebuild the committed plugin .wasm fixtures from wasm/oxicloud-plugin-hello/.
+# Requires the wasm32 target (devenv provides it; else `rustup target add
+# wasm32-unknown-unknown`). Commit the regenerated files; CI fails on drift.
+plugin-build:
+    bash scripts/build-plugin-hello.sh
+
+# Build the example plugin and bundle plugin.toml + .wasm into an installable
+# .zip at dist/oxicloud-plugin-hello.zip (upload via the admin Plugins tab).
+plugin-example-zip:
+    bash scripts/build-plugin-zip.sh
+
+# fmt + clippy the example plugin crate (standalone workspace, wasm32 target).
+plugin-check:
+    cd wasm/oxicloud-plugin-hello; cargo fmt --all
+    cd wasm/oxicloud-plugin-hello; cargo clippy --target wasm32-unknown-unknown --release -- -D warnings
+
 # audit security (condition: cargo install cargo-audit)
 audit:
     cargo audit

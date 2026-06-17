@@ -13,6 +13,17 @@ let usersPage = 0;
 const PAGE_SIZE = 50;
 let totalUsers = 0;
 
+/* Plugin detail / log viewer state */
+const PLUGIN_LOGS_PAGE_SIZE = 50;
+/** @type {Record<string, PluginInfo>} */
+let pluginsById = {};
+/** @type {string|null} */
+let pluginDetailId = null;
+let pluginLogsPage = 0;
+let pluginLogsTotal = 0;
+/** @type {EventSource|null} */
+let pluginLogStream = null;
+
 /**
  * Escape a string for safe embedding inside a JS string literal within an HTML attribute.
  * @param {string} s
@@ -148,10 +159,13 @@ function switchTab(name, el) {
     // visible — without this it would keep hitting the API every 2 s
     // (and updating hidden DOM) for as long as a migration runs.
     if (name !== 'storage') stopMigrationPolling();
+    // Leaving the plugins tab tears down the live log stream.
+    if (name !== 'plugins') stopLogStream();
     if (name === 'users') loadUsers();
     if (name === 'dashboard') loadDashboard();
     if (name === 'storage') loadStorage();
     if (name === 'smtp') loadSmtp();
+    if (name === 'plugins') loadPlugins();
 }
 
 async function loadDashboard() {
@@ -1280,6 +1294,514 @@ async function sendSmtpTest() {
     }
 }
 
+/* ── Plugins ── */
+
+/**
+ * @typedef {Object} PluginInfo
+ * @property {string} id
+ * @property {string} name
+ * @property {string} version
+ * @property {number} abi
+ * @property {string[]} subscriptions
+ * @property {boolean} enabled
+ */
+
+/**
+ * Load installed plugins into the table. A 503 means plugins are disabled on
+ * the server — show the explanatory banner instead of the management UI.
+ */
+async function loadPlugins() {
+    const tbody = document.getElementById('plugins-tbody');
+    const disabledEl = document.getElementById('plugins-disabled');
+    const mainEl = document.getElementById('plugins-main');
+    if (!tbody || !disabledEl || !mainEl) return;
+    // Always return to the list view (and stop any live tail) when (re)loading.
+    closePluginDetail();
+    try {
+        const resp = await fetch(`${API}/admin/plugins`, {
+            headers: headers(),
+            credentials: 'same-origin'
+        });
+        if (resp.status === 503) {
+            disabledEl.classList.remove('hidden');
+            mainEl.classList.add('hidden');
+            return;
+        }
+        disabledEl.classList.add('hidden');
+        mainEl.classList.remove('hidden');
+        if (!resp.ok) {
+            tbody.innerHTML = `<tr><td colspan="6" class="table-status-error"><i class="fas fa-exclamation-circle"></i> ${escapeHtml(`HTTP ${resp.status}`)}</td></tr>`;
+            return;
+        }
+        /** @type {{enabled: boolean, plugins: PluginInfo[]}} */
+        const data = await resp.json();
+        renderPluginRows(data.plugins || []);
+    } catch (e) {
+        tbody.innerHTML = `<tr><td colspan="6" class="table-status-error"><i class="fas fa-exclamation-circle"></i> ${escapeHtml(i18n.t('admin.error_network', { message: /** @type {Error} */ (e).message }))}</td></tr>`;
+    }
+}
+
+/** @param {PluginInfo[]} plugins */
+function renderPluginRows(plugins) {
+    const tbody = document.getElementById('plugins-tbody');
+    if (!tbody) return;
+    pluginsById = {};
+    plugins.forEach((p) => {
+        pluginsById[p.id] = p;
+    });
+    if (plugins.length === 0) {
+        tbody.innerHTML = `<tr><td colspan="6" class="table-status-empty">${escapeHtml(i18n.t('admin.plugins_none') || 'No plugins installed.')}</td></tr>`;
+        return;
+    }
+    tbody.innerHTML = plugins
+        .map((p) => {
+            const events = (p.subscriptions || []).map((ev) => `<code>${escapeHtml(ev)}</code>`).join(' ') || '—';
+            const statusLabel = p.enabled ? i18n.t('admin.plugins_enabled') || 'Enabled' : i18n.t('admin.plugins_disabled_badge') || 'Disabled';
+            const statusBadge = `<span class="badge badge-${p.enabled ? 'active' : 'inactive'}">${escapeHtml(statusLabel)}</span>`;
+            const toggleTitle = p.enabled ? i18n.t('admin.plugins_disable') || 'Disable' : i18n.t('admin.plugins_enable') || 'Enable';
+            const toggleBtn =
+                `<button class="btn btn-sm ${p.enabled ? 'btn-secondary' : 'btn-success'} plugin-action-btn" data-action="toggle" data-pid="${_escJs(p.id)}" data-enabled="${p.enabled}" title="${escapeHtml(toggleTitle)}">` +
+                `<i class="fas fa-${p.enabled ? 'pause' : 'play'}"></i></button>`;
+            const deleteBtn =
+                `<button class="btn btn-sm btn-danger plugin-action-btn" data-action="delete" data-pid="${_escJs(p.id)}" data-pname="${_escJs(p.name)}" title="${escapeHtml(i18n.t('admin.plugins_delete') || 'Delete')}">` +
+                '<i class="fas fa-trash-alt"></i></button>';
+            const detailsBtn =
+                `<button class="btn btn-sm btn-secondary plugin-action-btn" data-action="details" data-pid="${_escJs(p.id)}" title="${escapeHtml(i18n.t('admin.plugins_details') || 'Logs & details')}">` +
+                '<i class="fas fa-list"></i></button>';
+            return (
+                '<tr>' +
+                `<td>${escapeHtml(p.name)}</td>` +
+                `<td><code>${escapeHtml(p.id)}</code></td>` +
+                `<td>${escapeHtml(p.version)}</td>` +
+                `<td>${events}</td>` +
+                `<td>${statusBadge}</td>` +
+                `<td><div class="actions-row">${detailsBtn}${toggleBtn}${deleteBtn}</div></td>` +
+                '</tr>'
+            );
+        })
+        .join('');
+
+    /** @type {NodeListOf<HTMLButtonElement>} */ (document.querySelectorAll('#plugins-tbody .plugin-action-btn')).forEach((btn) => {
+        btn.addEventListener('click', () => {
+            const action = btn.dataset.action;
+            if (action === 'toggle') togglePlugin(btn.dataset.pid, btn.dataset.enabled !== 'true');
+            else if (action === 'delete') deletePlugin(btn.dataset.pid, btn.dataset.pname);
+            else if (action === 'details') openPluginDetail(btn.dataset.pid);
+        });
+    });
+}
+
+/**
+ * @param {string|undefined} id
+ * @param {boolean} enable
+ */
+async function togglePlugin(id, enable) {
+    if (!id) return;
+    try {
+        const resp = await fetch(`${API}/admin/plugins/${encodeURIComponent(id)}/enabled`, {
+            method: 'PUT',
+            headers: headers(),
+            credentials: 'same-origin',
+            body: JSON.stringify({ enabled: enable })
+        });
+        if (resp.ok) {
+            loadPlugins();
+        } else {
+            const e = await resp.json().catch(() => ({}));
+            alert(e.message || i18n.t('admin.error_generic'));
+        }
+    } catch (e) {
+        alert(i18n.t('admin.error_network', { message: /** @type {Error} */ (e).message }));
+    }
+}
+
+/**
+ * @param {string|undefined} id
+ * @param {string|undefined} name
+ */
+async function deletePlugin(id, name) {
+    if (!id) return;
+    const ok = await showConfirm(i18n.t('admin.plugins_confirm_delete', { name: name || id }));
+    if (!ok) return;
+    try {
+        const resp = await fetch(`${API}/admin/plugins/${encodeURIComponent(id)}`, {
+            method: 'DELETE',
+            headers: headers(),
+            credentials: 'same-origin'
+        });
+        if (resp.ok) {
+            loadPlugins();
+        } else {
+            const e = await resp.json().catch(() => ({}));
+            alert(e.message || i18n.t('admin.error_generic'));
+        }
+    } catch (e) {
+        alert(i18n.t('admin.error_network', { message: /** @type {Error} */ (e).message }));
+    }
+}
+
+/**
+ * Install a plugin from the selected .zip bundle. The multipart Content-Type
+ * (with its boundary) is set by the browser — do not override it.
+ */
+async function installPlugin() {
+    const bundleInput = /** @type {HTMLInputElement | null} */ (document.getElementById('plugin-bundle-file'));
+    const btn = /** @type {HTMLButtonElement | null} */ (document.getElementById('btn-plugin-install'));
+    const resultEl = document.getElementById('plugin-install-result');
+    if (!bundleInput || !resultEl) return;
+
+    const bundleFile = bundleInput.files?.[0];
+    if (!bundleFile) {
+        resultEl.className = 'alert alert-error';
+        resultEl.style.display = 'block';
+        resultEl.textContent = i18n.t('admin.plugins_install_missing_bundle') || 'Select a plugin bundle (.zip).';
+        return;
+    }
+
+    const form = new FormData();
+    form.append('bundle', bundleFile);
+
+    if (btn) btn.disabled = true;
+    resultEl.className = 'alert alert-info';
+    resultEl.style.display = 'block';
+    resultEl.textContent = i18n.t('admin.plugins_installing') || 'Installing…';
+
+    try {
+        const resp = await fetch(`${API}/admin/plugins`, {
+            method: 'POST',
+            headers: { ...getCsrfHeaders() },
+            credentials: 'same-origin',
+            body: form
+        });
+        if (!resp.ok) {
+            const e = await resp.json().catch(() => ({}));
+            resultEl.className = 'alert alert-error';
+            resultEl.textContent = e.message || `HTTP ${resp.status}`;
+            return;
+        }
+        /** @type {PluginInfo} */
+        const info = await resp.json();
+        resultEl.className = 'alert alert-success';
+        resultEl.textContent = i18n.t('admin.plugins_installed', { name: info.name }) || `Installed ${info.name}.`;
+        bundleInput.value = '';
+        loadPlugins();
+    } catch (e) {
+        resultEl.className = 'alert alert-error';
+        resultEl.textContent = i18n.t('admin.error_network', { message: /** @type {Error} */ (e).message });
+    } finally {
+        if (btn) btn.disabled = false;
+    }
+}
+
+/* ── Plugin detail page (metadata + retention + logs + live tail) ── */
+
+/**
+ * @typedef {Object} PluginLogEntry
+ * @property {string} ts
+ * @property {string} invocation_id
+ * @property {string} kind
+ * @property {string} level
+ * @property {string} [reason]
+ * @property {string} msg
+ */
+
+/**
+ * @typedef {Object} PluginLogPage
+ * @property {PluginLogEntry[]} entries
+ * @property {number} total
+ * @property {number} limit
+ * @property {number} offset
+ */
+
+/**
+ * Open the detail page for a plugin: metadata, retention form, and its logs
+ * (with a live tail). Hides the list view until the user goes back.
+ * @param {string|undefined} id
+ */
+function openPluginDetail(id) {
+    if (!id) return;
+    const plugin = pluginsById[id];
+    if (!plugin) return;
+    pluginDetailId = id;
+    pluginLogsPage = 0;
+
+    hideElement('plugins-main');
+    showElement('plugin-detail-view');
+
+    const nameEl = document.getElementById('plugin-detail-name');
+    if (nameEl) nameEl.textContent = plugin.name;
+    renderPluginMeta(plugin);
+
+    loadPluginRetention();
+    loadPluginLogs();
+    startLogStream(id);
+}
+
+/** Return to the installed-plugins list and stop the live stream. */
+function closePluginDetail() {
+    stopLogStream();
+    pluginDetailId = null;
+    hideElement('plugin-detail-view');
+    showElement('plugins-main');
+}
+
+/** @param {PluginInfo} p */
+function renderPluginMeta(p) {
+    const meta = document.getElementById('plugin-detail-meta');
+    if (!meta) return;
+    const events = (p.subscriptions || []).map((ev) => `<code>${escapeHtml(ev)}</code>`).join(' ') || '—';
+    const statusLabel = p.enabled ? i18n.t('admin.plugins_enabled') || 'Enabled' : i18n.t('admin.plugins_disabled_badge') || 'Disabled';
+    const statusBadge = `<span class="badge badge-${p.enabled ? 'active' : 'inactive'}">${escapeHtml(statusLabel)}</span>`;
+    /** @param {string} label @param {string} value */
+    const row = (label, value) => `<dt>${escapeHtml(label)}</dt><dd>${value}</dd>`;
+    meta.innerHTML =
+        row(i18n.t('admin.plugins_col_id') || 'ID', `<code>${escapeHtml(p.id)}</code>`) +
+        row(i18n.t('admin.plugins_col_version') || 'Version', escapeHtml(p.version)) +
+        row('ABI', escapeHtml(String(p.abi))) +
+        row(i18n.t('admin.plugins_col_events') || 'Events', events) +
+        row(i18n.t('admin.plugins_col_status') || 'Status', statusBadge);
+}
+
+/** Read the current log filter from the toolbar inputs. */
+function pluginLogFilter() {
+    const level = /** @type {HTMLSelectElement|null} */ (document.getElementById('plugin-logs-level'))?.value || '';
+    const search = /** @type {HTMLInputElement|null} */ (document.getElementById('plugin-logs-search'))?.value || '';
+    return { level, search };
+}
+
+/** Load a page of the current plugin's logs into the table. */
+async function loadPluginLogs() {
+    const id = pluginDetailId;
+    const tbody = document.getElementById('plugin-logs-tbody');
+    if (!id || !tbody) return;
+    const { level, search } = pluginLogFilter();
+    const params = new URLSearchParams();
+    params.set('limit', String(PLUGIN_LOGS_PAGE_SIZE));
+    params.set('offset', String(pluginLogsPage * PLUGIN_LOGS_PAGE_SIZE));
+    if (level) params.set('level', level);
+    if (search) params.set('search', search);
+
+    try {
+        const resp = await fetch(`${API}/admin/plugins/${encodeURIComponent(id)}/logs?${params.toString()}`, {
+            headers: headers(),
+            credentials: 'same-origin'
+        });
+        if (!resp.ok) {
+            tbody.innerHTML = `<tr><td colspan="5" class="table-status-error"><i class="fas fa-exclamation-circle"></i> ${escapeHtml(`HTTP ${resp.status}`)}</td></tr>`;
+            return;
+        }
+        /** @type {PluginLogPage} */
+        const page = await resp.json();
+        pluginLogsTotal = page.total;
+        renderPluginLogRows(page.entries || []);
+        updatePluginLogsPagination();
+    } catch (e) {
+        tbody.innerHTML = `<tr><td colspan="5" class="table-status-error"><i class="fas fa-exclamation-circle"></i> ${escapeHtml(i18n.t('admin.error_network', { message: /** @type {Error} */ (e).message }))}</td></tr>`;
+    }
+}
+
+/** @param {PluginLogEntry[]} entries */
+function renderPluginLogRows(entries) {
+    const tbody = document.getElementById('plugin-logs-tbody');
+    if (!tbody) return;
+    if (entries.length === 0) {
+        tbody.innerHTML = `<tr><td colspan="5" class="table-status-empty">${escapeHtml(i18n.t('admin.plugins_logs_none') || 'No log entries.')}</td></tr>`;
+        return;
+    }
+    tbody.innerHTML = entries.map(pluginLogRowHtml).join('');
+}
+
+/** @param {PluginLogEntry} e */
+function pluginLogRowHtml(e) {
+    const level = (e.level || 'info').toLowerCase();
+    const levelBadge = `<span class="plugin-log-level plugin-log-level--${escapeHtml(level)}">${escapeHtml(level)}</span>`;
+    const kind = e.kind === 'outcome' ? e.reason || 'outcome' : 'log';
+    return (
+        '<tr>' +
+        `<td class="plugin-log-ts">${escapeHtml(timeAgo(e.ts))}</td>` +
+        `<td>${levelBadge}</td>` +
+        `<td><code>${escapeHtml(kind)}</code></td>` +
+        `<td><code class="plugin-log-inv">${escapeHtml(e.invocation_id)}</code></td>` +
+        `<td class="plugin-log-msg">${escapeHtml(e.msg)}</td>` +
+        '</tr>'
+    );
+}
+
+function updatePluginLogsPagination() {
+    const info = document.getElementById('plugin-logs-info');
+    const prev = /** @type {HTMLButtonElement|null} */ (document.getElementById('plugin-logs-prev'));
+    const next = /** @type {HTMLButtonElement|null} */ (document.getElementById('plugin-logs-next'));
+    if (info) {
+        if (pluginLogsTotal === 0) {
+            info.textContent = i18n.t('admin.plugins_logs_none') || 'No log entries.';
+        } else {
+            const from = pluginLogsPage * PLUGIN_LOGS_PAGE_SIZE + 1;
+            const to = Math.min((pluginLogsPage + 1) * PLUGIN_LOGS_PAGE_SIZE, pluginLogsTotal);
+            info.textContent = i18n.t('admin.plugins_logs_showing', { from, to, total: pluginLogsTotal }) || `Showing ${from}–${to} of ${pluginLogsTotal}`;
+        }
+    }
+    if (prev) prev.disabled = pluginLogsPage === 0;
+    if (next) next.disabled = (pluginLogsPage + 1) * PLUGIN_LOGS_PAGE_SIZE >= pluginLogsTotal;
+}
+
+/**
+ * Open the SSE live tail for the given plugin.
+ * @param {string} id
+ */
+function startLogStream(id) {
+    stopLogStream();
+    const live = /** @type {HTMLInputElement|null} */ (document.getElementById('plugin-logs-live'));
+    if (live && !live.checked) return;
+    const es = new EventSource(`${API}/admin/plugins/${encodeURIComponent(id)}/logs/stream`, { withCredentials: true });
+    es.onmessage = (ev) => {
+        try {
+            /** @type {PluginLogEntry} */
+            const entry = JSON.parse(ev.data);
+            onLiveLogEntry(entry);
+        } catch {
+            /* ignore malformed frames */
+        }
+    };
+    es.addEventListener('lagged', () => {
+        // Fell behind the broadcast buffer — resync from the server.
+        loadPluginLogs();
+    });
+    pluginLogStream = es;
+}
+
+/** Close the live tail if open. */
+function stopLogStream() {
+    if (pluginLogStream) {
+        pluginLogStream.close();
+        pluginLogStream = null;
+    }
+}
+
+/**
+ * Handle a streamed entry: only prepend when viewing the newest page and the
+ * entry passes the active filter, so the live tail never fights pagination.
+ * @param {PluginLogEntry} entry
+ */
+function onLiveLogEntry(entry) {
+    if (pluginLogsPage !== 0) return;
+    const { level, search } = pluginLogFilter();
+    if (level && (entry.level || '').toLowerCase() !== level.toLowerCase()) return;
+    if (search && !(entry.msg || '').toLowerCase().includes(search.toLowerCase())) return;
+
+    const tbody = document.getElementById('plugin-logs-tbody');
+    if (!tbody) return;
+    // Drop any "empty" placeholder row before inserting the first live entry.
+    const placeholder = tbody.querySelector('.table-status-empty');
+    if (placeholder) tbody.innerHTML = '';
+
+    tbody.insertAdjacentHTML('afterbegin', pluginLogRowHtml(entry));
+    const firstRow = tbody.firstElementChild;
+    if (firstRow) firstRow.classList.add('plugin-log-row--new');
+    // Keep the page bounded to one page-worth of rows.
+    while (tbody.children.length > PLUGIN_LOGS_PAGE_SIZE) {
+        const last = tbody.lastElementChild;
+        if (!last) break;
+        last.remove();
+    }
+    pluginLogsTotal += 1;
+    updatePluginLogsPagination();
+}
+
+/** Load the current plugin's retention into the form. */
+async function loadPluginRetention() {
+    const id = pluginDetailId;
+    if (!id) return;
+    try {
+        const resp = await fetch(`${API}/admin/plugins/${encodeURIComponent(id)}/retention`, {
+            headers: headers(),
+            credentials: 'same-origin'
+        });
+        if (!resp.ok) return;
+        /** @type {{retention_days: number, max_bytes: number}} */
+        const r = await resp.json();
+        const daysEl = /** @type {HTMLInputElement|null} */ (document.getElementById('plugin-retention-days'));
+        const mbEl = /** @type {HTMLInputElement|null} */ (document.getElementById('plugin-retention-max-mb'));
+        if (daysEl) daysEl.value = String(r.retention_days);
+        if (mbEl) mbEl.value = String(Math.round(r.max_bytes / (1024 * 1024)));
+    } catch {
+        /* leave fields as-is on error */
+    }
+}
+
+/** Persist the retention form for the current plugin. */
+async function savePluginRetention() {
+    const id = pluginDetailId;
+    const resultEl = document.getElementById('plugin-retention-result');
+    if (!id || !resultEl) return;
+    const days = Number(/** @type {HTMLInputElement} */ (document.getElementById('plugin-retention-days')).value);
+    const mb = Number(/** @type {HTMLInputElement} */ (document.getElementById('plugin-retention-max-mb')).value);
+    if (!Number.isFinite(days) || days < 0 || !Number.isFinite(mb) || mb < 0) {
+        resultEl.className = 'alert alert-error';
+        resultEl.style.display = 'block';
+        resultEl.textContent = i18n.t('admin.plugins_retention_invalid') || 'Enter non-negative numbers.';
+        return;
+    }
+    try {
+        const resp = await fetch(`${API}/admin/plugins/${encodeURIComponent(id)}/retention`, {
+            method: 'PUT',
+            headers: headers(),
+            credentials: 'same-origin',
+            body: JSON.stringify({ retention_days: Math.round(days), max_bytes: Math.round(mb) * 1024 * 1024 })
+        });
+        if (resp.ok) {
+            resultEl.className = 'alert alert-success';
+            resultEl.style.display = 'block';
+            resultEl.textContent = i18n.t('admin.plugins_retention_saved') || 'Retention saved.';
+        } else {
+            const e = await resp.json().catch(() => ({}));
+            resultEl.className = 'alert alert-error';
+            resultEl.style.display = 'block';
+            resultEl.textContent = e.message || `HTTP ${resp.status}`;
+        }
+    } catch (e) {
+        resultEl.className = 'alert alert-error';
+        resultEl.style.display = 'block';
+        resultEl.textContent = i18n.t('admin.error_network', { message: /** @type {Error} */ (e).message });
+    }
+}
+
+/** Clear all persisted logs for the current plugin. */
+async function clearPluginLogs() {
+    const id = pluginDetailId;
+    if (!id) return;
+    const ok = await showConfirm(i18n.t('admin.plugins_logs_confirm_clear') || 'Clear all logs for this plugin?');
+    if (!ok) return;
+    try {
+        const resp = await fetch(`${API}/admin/plugins/${encodeURIComponent(id)}/logs`, {
+            method: 'DELETE',
+            headers: headers(),
+            credentials: 'same-origin'
+        });
+        if (resp.ok) {
+            pluginLogsPage = 0;
+            loadPluginLogs();
+        } else {
+            const e = await resp.json().catch(() => ({}));
+            alert(e.message || i18n.t('admin.error_generic'));
+        }
+    } catch (e) {
+        alert(i18n.t('admin.error_network', { message: /** @type {Error} */ (e).message }));
+    }
+}
+
+function pluginLogsPrevPage() {
+    if (pluginLogsPage > 0) {
+        pluginLogsPage--;
+        loadPluginLogs();
+    }
+}
+function pluginLogsNextPage() {
+    if ((pluginLogsPage + 1) * PLUGIN_LOGS_PAGE_SIZE < pluginLogsTotal) {
+        pluginLogsPage++;
+        loadPluginLogs();
+    }
+}
+
 /* ── Apply i18n when translations load / change ── */
 document.addEventListener('translationsLoaded', () => {
     i18n.translatePage();
@@ -1312,7 +1834,40 @@ document.getElementById('tab-btn-smtp').addEventListener('click', function () {
     switchTab('smtp', this);
 });
 
+document.getElementById('tab-btn-plugins').addEventListener('click', function () {
+    switchTab('plugins', this);
+});
+
 document.getElementById('btn-smtp-test').addEventListener('click', sendSmtpTest);
+
+document.getElementById('btn-plugin-install').addEventListener('click', installPlugin);
+
+/* Plugin detail page controls */
+document.getElementById('plugin-detail-back')?.addEventListener('click', closePluginDetail);
+document.getElementById('plugin-retention-save')?.addEventListener('click', savePluginRetention);
+document.getElementById('plugin-logs-refresh')?.addEventListener('click', loadPluginLogs);
+document.getElementById('plugin-logs-clear')?.addEventListener('click', clearPluginLogs);
+document.getElementById('plugin-logs-prev')?.addEventListener('click', pluginLogsPrevPage);
+document.getElementById('plugin-logs-next')?.addEventListener('click', pluginLogsNextPage);
+document.getElementById('plugin-logs-level')?.addEventListener('change', () => {
+    pluginLogsPage = 0;
+    loadPluginLogs();
+});
+let pluginLogsSearchTimer = 0;
+document.getElementById('plugin-logs-search')?.addEventListener('input', () => {
+    window.clearTimeout(pluginLogsSearchTimer);
+    pluginLogsSearchTimer = window.setTimeout(() => {
+        pluginLogsPage = 0;
+        loadPluginLogs();
+    }, 250);
+});
+document.getElementById('plugin-logs-live')?.addEventListener('change', function () {
+    if (/** @type {HTMLInputElement} */ (this).checked) {
+        if (pluginDetailId) startLogStream(pluginDetailId);
+    } else {
+        stopLogStream();
+    }
+});
 
 document.getElementById('ds-registration').addEventListener('change', function () {
     toggleRegistration(/** @type {HTMLInputElement} */ (this).checked);
