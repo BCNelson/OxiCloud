@@ -10,7 +10,9 @@
  * original streams in only on demand via the toolbar expand button.
  */
 
+import { Modal } from '../../components/modal.js';
 import { getCsrfHeaders } from '../../core/csrf.js';
+import { i18n } from '../../core/i18n.js';
 import { favorites } from '../library/favorites.js';
 
 /** @import {FileItem, FileMetadata} from '../../core/types.js' */
@@ -182,6 +184,15 @@ export const photosLightbox = {
         filename.textContent = item.name;
         counter.textContent = `${this.index + 1} / ${this.items.length}`;
 
+        // Reflect the current favorite state on the toolbar star.
+        const favBtn = this._overlay.querySelector('.lb-favorite');
+        if (favBtn) {
+            const isFav = favorites.isFavorite(item.id, 'file');
+            favBtn.classList.toggle('active', isFav);
+            const favIcon = favBtn.querySelector('i');
+            if (favIcon) favIcon.className = isFav ? 'fas fa-star' : 'far fa-star';
+        }
+
         // Format date
         const ts = (item.sort_date || item.created_at) * 1000;
         const dateStr = new Date(ts).toLocaleDateString(undefined, {
@@ -317,23 +328,25 @@ export const photosLightbox = {
         a.remove();
     },
 
-    /** Toggle favorite on current item */
+    /** Toggle favorite on current item (via the favorites module so its
+     *  cache stays in sync — the lightbox can then show the right initial
+     *  star next time the item is opened). */
     async _toggleFavorite() {
         const item = this.items[this.index];
-        if (!item || !favorites) return;
+        if (!item) return;
+        const isFav = favorites.isFavorite(item.id, 'file');
         try {
-            await fetch(`/api/favorites/file/${item.id}`, {
-                method: 'POST',
-                credentials: 'include',
-                headers: this._headers()
-            });
-            const btn = this._overlay.querySelector('.lb-favorite');
+            if (isFav) {
+                await favorites.removeFromFavorites(item.id, 'file', item.name);
+            } else {
+                await favorites.addToFavorites(item.id, item.name, 'file', null);
+            }
+            const btn = this._overlay?.querySelector('.lb-favorite');
             if (btn) {
-                btn.classList.toggle('active');
+                const nowFav = !isFav;
+                btn.classList.toggle('active', nowFav);
                 const icon = btn.querySelector('i');
-                if (icon) {
-                    icon.className = btn.classList.contains('active') ? 'fas fa-star' : 'far fa-star';
-                }
+                if (icon) icon.className = nowFav ? 'fas fa-star' : 'far fa-star';
             }
         } catch (err) {
             console.error('Favorite toggle failed:', err);
@@ -344,7 +357,13 @@ export const photosLightbox = {
     async _delete() {
         const item = this.items[this.index];
         if (!item) return;
-        if (!confirm(`Delete ${item.name}?`)) return;
+        const ok = await Modal.confirmDialog({
+            title: i18n.t('photos.delete_title'),
+            message: i18n.t('photos.delete_one_confirm', { name: item.name }),
+            confirmText: i18n.t('actions.delete'),
+            icon: 'fa-trash'
+        });
+        if (!ok) return;
 
         try {
             await fetch(`/api/files/${item.id}`, {

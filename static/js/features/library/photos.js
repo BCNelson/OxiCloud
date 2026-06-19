@@ -3,6 +3,7 @@
  * Photo grid grouped by day/month/year, with infinite scroll and multi-select.
  */
 
+import { Modal } from '../../components/modal.js';
 import { getCsrfHeaders } from '../../core/csrf.js';
 import { i18n } from '../../core/i18n.js';
 import { thumbnail } from '../thumbnail.js';
@@ -665,7 +666,13 @@ const photosView = {
         const bar_delete = /** @type {HTMLButtonElement} */ (bar.querySelector('#photos-sel-delete'));
         if (bar_delete) {
             bar_delete.onclick = async () => {
-                if (!confirm('Delete selected items?')) return;
+                const ok = await Modal.confirmDialog({
+                    title: i18n.t('photos.delete_title'),
+                    message: i18n.t('photos.delete_selected_confirm'),
+                    confirmText: i18n.t('actions.delete'),
+                    icon: 'fa-trash'
+                });
+                if (!ok) return;
 
                 // One batch request per chunk instead of one DELETE per photo.
                 // The photos view is files-only, so every id is a file id.
