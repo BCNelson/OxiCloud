@@ -68,7 +68,25 @@
         "items_selected": "selected",
         "view_daily": "Day",
         "view_monthly": "Month",
-        "view_yearly": "Year"
+        "view_yearly": "Year",
+        "delete_title": "Move to Trash",
+        "delete_selected_confirm": "Move the selected items to Trash?",
+        "delete_one_confirm": "Move \"{{name}}\" to Trash?",
+        "layout_square": "Grid",
+        "layout_justified": "Justified",
+        "tab_moments": "Moments",
+        "tab_places": "Places",
+        "tab_people": "People",
+        "map_loading": "Loading map…",
+        "map_error": "Could not load the map"
+    },
+    "people": {
+        "unnamed": "Unnamed",
+        "empty": "No people yet",
+        "disabled": "Face recognition is disabled",
+        "rename_title": "Name this person",
+        "name_label": "Name",
+        "back": "Back"
     },
     "music": {
         "create_playlist": "Create Playlist",

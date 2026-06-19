@@ -20,6 +20,8 @@ type MediaFileRow = (
     String,         // blob_hash
     Option<Uuid>,   // user_id
     i64,            // sort_date
+    Option<i32>,    // width
+    Option<i32>,    // height
 );
 
 use bytes::Bytes;
@@ -30,6 +32,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::application::dtos::geo_dto::{GeoBounds, GeoCluster};
 use crate::application::dtos::search_dto::SearchCriteriaDto;
 use crate::application::ports::storage_ports::FileReadPort;
 use crate::common::errors::DomainError;
@@ -416,7 +419,7 @@ impl FileBlobReadRepository {
         owner_id: Uuid,
         before: Option<i64>,
         limit: i64,
-    ) -> Result<(Vec<File>, Vec<i64>), DomainError> {
+    ) -> Result<(Vec<File>, Vec<i64>, Vec<(Option<i32>, Option<i32>)>), DomainError> {
         let rows: Vec<MediaFileRow> = sqlx::query_as(
             r#"
             SELECT fi.id::text, fi.name, fi.folder_id::text, fo.path,
@@ -425,9 +428,11 @@ impl FileBlobReadRepository {
                    EXTRACT(EPOCH FROM fi.updated_at)::bigint,
                    fi.blob_hash,
                    fi.user_id,
-                   EXTRACT(EPOCH FROM fi.media_sort_date)::bigint AS sort_date
+                   EXTRACT(EPOCH FROM fi.media_sort_date)::bigint AS sort_date,
+                   fm.width, fm.height
               FROM storage.files fi
               LEFT JOIN storage.folders fo ON fo.id = fi.folder_id
+              LEFT JOIN storage.file_metadata fm ON fm.file_id = fi.id
              WHERE fi.user_id = $1
                AND NOT fi.is_trashed
                AND (fi.mime_type LIKE 'image/%' OR fi.mime_type LIKE 'video/%')
@@ -446,15 +451,67 @@ impl FileBlobReadRepository {
 
         let mut files = Vec::with_capacity(rows.len());
         let mut sort_dates = Vec::with_capacity(rows.len());
+        let mut dims = Vec::with_capacity(rows.len());
 
-        for (id, name, fid, fpath, size, mime, ca, ma, blob_hash, uid, sd) in rows {
+        for (id, name, fid, fpath, size, mime, ca, ma, blob_hash, uid, sd, w, h) in rows {
             files.push(Self::row_to_file(
                 id, name, fid, fpath, size, mime, ca, ma, blob_hash, uid,
             )?);
             sort_dates.push(sd);
+            dims.push((w, h));
         }
 
-        Ok((files, sort_dates))
+        Ok((files, sort_dates, dims))
+    }
+
+    /// Aggregate the caller's geotagged photos into grid cells of side `cell`
+    /// (degrees) within `bounds`. Plain SQL (no PostGIS), scoped to `user_id`.
+    /// Returns one cluster per non-empty cell with its centroid, photo count
+    /// and a representative photo id (for the cluster thumbnail).
+    pub async fn list_geo_clusters(
+        &self,
+        user_id: Uuid,
+        bounds: GeoBounds,
+        cell: f64,
+    ) -> Result<Vec<GeoCluster>, DomainError> {
+        let rows: Vec<(i64, f64, f64, String)> = sqlx::query_as(
+            r#"
+            SELECT count(*)              AS n,
+                   avg(fm.longitude)     AS clng,
+                   avg(fm.latitude)      AS clat,
+                   min(fm.file_id::text) AS sample_id
+              FROM storage.file_metadata fm
+              JOIN storage.files fi ON fi.id = fm.file_id
+             WHERE fi.user_id = $1
+               AND NOT fi.is_trashed
+               AND fm.latitude IS NOT NULL
+               AND fm.longitude IS NOT NULL
+               AND fm.longitude BETWEEN $2 AND $3
+               AND fm.latitude  BETWEEN $4 AND $5
+             GROUP BY round(fm.longitude / $6), round(fm.latitude / $6)
+            "#,
+        )
+        .bind(user_id)
+        .bind(bounds.west)
+        .bind(bounds.east)
+        .bind(bounds.south)
+        .bind(bounds.north)
+        .bind(cell)
+        .fetch_all(self.pool.as_ref())
+        .await
+        .map_err(|e| {
+            DomainError::internal_error("FileBlobRead", format!("list_geo_clusters: {e}"))
+        })?;
+
+        Ok(rows
+            .into_iter()
+            .map(|(n, clng, clat, sample_id)| GeoCluster {
+                lng: clng,
+                lat: clat,
+                count: n,
+                sample_file_id: sample_id,
+            })
+            .collect())
     }
 }
 
