@@ -10,6 +10,7 @@ pub mod favorites_dto;
 pub mod file_dto;
 pub mod folder_dto;
 pub mod folder_listing_dto;
+pub mod geo_dto;
 pub mod grant_dto;
 pub mod i18n_dto;
 pub mod pagination;

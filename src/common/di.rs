@@ -17,6 +17,7 @@ use crate::application::services::folder_service::FolderService;
 use crate::application::services::i18n_application_service::I18nApplicationService;
 use crate::application::services::nextcloud_file_id_service::NextcloudFileIdService;
 use crate::application::services::nextcloud_login_flow_service::NextcloudLoginFlowService;
+use crate::application::services::places_service::PlacesService;
 use crate::application::services::recent_service::RecentService;
 use crate::application::services::search_service::SearchService;
 use crate::application::services::share_browse_service::ShareBrowseService;
@@ -798,6 +799,17 @@ impl AppServiceFactory {
         service
     }
 
+    /// Creates the Places (photo map) service. Reuses the existing file-read
+    /// repository — the data is the caller's own geotagged photos.
+    pub fn create_places_service(
+        &self,
+        file_read: &Arc<FileBlobReadRepository>,
+    ) -> Arc<PlacesService> {
+        let service = Arc::new(PlacesService::new(file_read.clone()));
+        tracing::info!("Places service initialized");
+        service
+    }
+
     /// Preloads translations for every locale in the registry. Build
     /// the registry at startup via `LocaleRegistry::discover` and pass
     /// the resulting list here.
@@ -1005,6 +1017,7 @@ impl AppServiceFactory {
         // 6. Database-dependent services (PgPool always available in blob model)
         let favorites_service: Option<Arc<FavoritesService>>;
         let recent_service: Option<Arc<RecentService>>;
+        let places_service: Option<Arc<PlacesService>>;
         let storage_usage_service: Option<Arc<StorageUsageService>>;
         let mut auth_services: Option<crate::common::di::AuthServices> = None;
         let mut nextcloud_services: Option<NextcloudServices> = None;
@@ -1026,6 +1039,12 @@ impl AppServiceFactory {
             let recent = self.create_recent_service(&pool);
             recent_service = Some(recent.clone());
             apps.recent_service = Some(recent);
+
+            places_service = if core.config.features.enable_places {
+                Some(self.create_places_service(&repos.file_read_repository))
+            } else {
+                None
+            };
 
             storage_usage_service = Some(storage_usage.clone());
 
@@ -1253,6 +1272,7 @@ impl AppServiceFactory {
             share_browse_service,
             favorites_service,
             recent_service,
+            places_service,
             storage_usage_service,
             calendar_service: None,
             contact_service: None,
@@ -1699,6 +1719,7 @@ pub struct AppState {
     pub share_browse_service: Option<Arc<ShareBrowseService>>,
     pub favorites_service: Option<Arc<FavoritesService>>,
     pub recent_service: Option<Arc<RecentService>>,
+    pub places_service: Option<Arc<PlacesService>>,
     pub storage_usage_service: Option<Arc<StorageUsageService>>,
     pub calendar_service: Option<Arc<CalendarService>>,
     pub contact_service: Option<Arc<ContactStorageAdapter>>,

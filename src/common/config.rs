@@ -879,6 +879,8 @@ pub struct FeaturesConfig {
     pub enable_trash: bool,
     pub enable_search: bool,
     pub enable_music: bool,
+    /// Lists the user's geotagged photos on a map (GET /api/photos/geo).
+    pub enable_places: bool,
     /// Expose other OxiCloud users as a read-only "system" address book
     /// at GET /api/address-books. Set to false to hide the user directory.
     pub expose_system_users: bool,
@@ -893,6 +895,7 @@ impl Default for FeaturesConfig {
             enable_trash: true,        // Enable trash feature
             enable_search: true,       // Enable search feature
             enable_music: true,        // Enable music feature
+            enable_places: false,      // Photo map; off until the map UI ships
             expose_system_users: true, // Expose OxiCloud users as address book by default
         }
     }
@@ -1376,6 +1379,12 @@ impl AppConfig {
             && let Ok(val) = enable_music
         {
             config.features.enable_music = val;
+        }
+
+        if let Ok(enable_places) = env::var("OXICLOUD_ENABLE_PLACES").map(|v| v.parse::<bool>())
+            && let Ok(val) = enable_places
+        {
+            config.features.enable_places = val;
         }
 
         // Content search (embedded Tantivy index)

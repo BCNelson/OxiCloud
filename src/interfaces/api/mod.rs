@@ -164,6 +164,7 @@ use crate::interfaces::api::handlers::file_handler::MoveFilePayload;
         handlers::recent_handler::clear_recent_items,
         // Photos handler (free function)
         handlers::photos_handler::list_photos,
+        handlers::photos_handler::list_photos_geo,
         // Batch handlers (free functions)
         handlers::batch_handler::move_files_batch,
         handlers::batch_handler::copy_files_batch,
