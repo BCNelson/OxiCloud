@@ -85,6 +85,10 @@ export function fileInlineUrl(fileId: string): string {
 	return `/api/files/${fileId}?inline=true`;
 }
 
-export function fileThumbnailUrl(fileId: string): string {
-	return `/api/files/${fileId}/thumbnail/preview`;
+/** Thumbnail URL for a file at the given size (server-rendered, content-typed). */
+export function fileThumbnailUrl(
+	fileId: string,
+	size: 'icon' | 'preview' | 'large' = 'preview'
+): string {
+	return `/api/files/${fileId}/thumbnail/${size}`;
 }

@@ -13,3 +13,4 @@ src/lib/icons/registry.ts
 static/locales/
 static/vendors/
 static/workers/
+static/basemaps/

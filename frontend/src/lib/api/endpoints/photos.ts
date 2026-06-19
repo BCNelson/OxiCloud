@@ -3,8 +3,17 @@ import { apiFetch } from '$lib/api/client';
 import { getCsrfHeaders } from '$lib/api/csrf';
 import type { FileItem } from '$lib/api/types';
 
+/**
+ * A timeline photo/video. Extends {@link FileItem} with the pixel dimensions the
+ * list endpoint returns, used by the justified (aspect-preserving) grid layout.
+ */
+export interface PhotoItem extends FileItem {
+	width?: number;
+	height?: number;
+}
+
 export interface PhotoPage {
-	items: FileItem[];
+	items: PhotoItem[];
 	nextCursor: string | null;
 }
 
@@ -27,6 +36,29 @@ export interface BatchTrashResult {
 	failed: string[];
 }
 
+/** One server-side photo cluster for the Places map (`GET /api/photos/geo`). */
+export interface GeoCluster {
+	lng: number;
+	lat: number;
+	count: number;
+	sample_file_id: string;
+}
+
+/**
+ * Fetch geotagged-photo clusters for a viewport. The backend aggregates
+ * server-side on a grid keyed by zoom, so the client draws one lightweight
+ * marker per cluster — no client-side clustering needed. `bbox` is
+ * `"west,south,east,north"` in decimal degrees. Available only when the
+ * Places feature is enabled (otherwise the route 404s).
+ */
+export async function fetchPhotosGeo(bbox: string, zoom: number): Promise<GeoCluster[]> {
+	const res = await apiFetch(`/api/photos/geo?bbox=${encodeURIComponent(bbox)}&zoom=${zoom}`, {
+		credentials: 'same-origin'
+	});
+	if (!res.ok) throw new Error(`photos geo failed: ${res.status}`);
+	return (await res.json()) as GeoCluster[];
+}
+
 /** Backend `MAX_BATCH_SIZE` — chunk larger selections into separate requests. */
 const BATCH_CHUNK_SIZE = 1000;
 
@@ -40,7 +72,7 @@ export async function fetchPhotos(limit = 60, before?: string | null): Promise<P
 	if (before) url += `&before=${encodeURIComponent(before)}`;
 	const res = await apiFetch(url, { credentials: 'same-origin' });
 	if (!res.ok) throw new Error(`photos failed: ${res.status}`);
-	const items = (await res.json()) as FileItem[];
+	const items = (await res.json()) as PhotoItem[];
 	const cursor = res.headers.get('X-Next-Cursor');
 	return {
 		items: items ?? [],

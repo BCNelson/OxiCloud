@@ -1,50 +1,52 @@
 <script lang="ts">
 	import Button from '$lib/components/Button.svelte';
 	import EmptyState from '$lib/components/EmptyState.svelte';
+	import PeopleView from '$lib/components/PeopleView.svelte';
+	import PhotoLightbox from '$lib/components/PhotoLightbox.svelte';
+	import PlacesMap from '$lib/components/PlacesMap.svelte';
 	import { useSelection } from '$lib/composables/useSelection.svelte';
-	import { errorMessage, errorToast } from '$lib/utils/errors';
+	import { errorToast } from '$lib/utils/errors';
 	import { onMount } from 'svelte';
 	import {
 		batchTrash,
-		fetchFileMetadata,
 		fetchPhotos,
 		uploadThumbnail,
-		type FileMetadata
+		type PhotoItem
 	} from '$lib/api/endpoints/photos';
-	import { addFavorite } from '$lib/api/endpoints/favorites';
-	import { deleteFile, fileDownloadUrl, fileInlineUrl } from '$lib/api/endpoints/files';
-	import type { FileItem } from '$lib/api/types';
+	import { peopleEnabled } from '$lib/api/endpoints/people';
+	import { fileDownloadUrl, fileThumbnailUrl } from '$lib/api/endpoints/files';
 	import Icon from '$lib/icons/Icon.svelte';
 	import { confirmDialog } from '$lib/stores/dialogs.svelte';
 	import { t } from '$lib/i18n/index.svelte';
 	import { ui } from '$lib/stores/ui.svelte';
+	import { isVideo, photoTimestamp } from '$lib/utils/media';
 
-	let items = $state<FileItem[]>([]);
+	type Tab = 'moments' | 'places' | 'people';
+	let tab = $state<Tab>('moments');
+	let peopleAvailable = $state(false);
+
+	let items = $state<PhotoItem[]>([]);
 	let cursor = $state<string | null>(null);
 	let exhausted = $state(false);
 	let loading = $state(false);
 	let error = $state<string | null>(null);
 	let sentinel = $state<HTMLElement | null>(null);
+	/** Usable content width of the grid, for the justified layout. */
+	let gridWidth = $state(0);
 
 	type GroupMode = 'day' | 'month' | 'year';
+	type LayoutMode = 'square' | 'justified';
 	const GROUP_KEY = 'oxicloud-photos-group';
+	const LAYOUT_KEY = 'oxicloud-photos-layout';
 	let groupMode = $state<GroupMode>('month');
+	let layoutMode = $state<LayoutMode>('square');
 	const selected = useSelection();
 	let lightbox = $state(-1); // index into `items`, -1 = closed
 
 	/** Client-generated video frame thumbnails (file id → data/URL). */
 	let videoThumbs = $state<Record<string, string>>({});
 
-	function isVideo(p: FileItem): boolean {
-		return (p.mime_type ?? '').startsWith('video/');
-	}
-
 	/** EXIF-aware timestamp (seconds → ms), matching the OLD grouping logic. */
-	function ts(p: FileItem): number {
-		const v = p.sort_date || p.created_at || 0;
-		return v < 1e12 ? v * 1000 : v;
-	}
-
 	function bucketKey(d: Date): string {
 		const y = d.getFullYear();
 		if (groupMode === 'year') return `${y}`;
@@ -66,10 +68,10 @@
 	}
 
 	const groups = $derived.by(() => {
-		const out: Array<{ key: string; label: string; photos: FileItem[] }> = [];
+		const out: Array<{ key: string; label: string; photos: PhotoItem[] }> = [];
 		const index = new Map<string, number>();
 		for (const p of items) {
-			const d = new Date(ts(p));
+			const d = new Date(photoTimestamp(p));
 			const key = bucketKey(d);
 			let i = index.get(key);
 			if (i === undefined) {
@@ -82,14 +84,58 @@
 		return out;
 	});
 
-	function iconUrl(id: string): string {
-		return `/api/files/${id}/thumbnail/icon`;
+	interface JustifiedTile {
+		file: PhotoItem;
+		w: number;
+		h: number;
 	}
-	function previewUrl(id: string): string {
-		return `/api/files/${id}/thumbnail/preview`;
-	}
-	function largeUrl(id: string): string {
-		return `/api/files/${id}/thumbnail/large`;
+
+	/**
+	 * Pack files into justified rows (Flickr-style): each full row is scaled to
+	 * fill `width` while preserving every tile's aspect ratio. Missing dimensions
+	 * fall back to 1:1.
+	 */
+	function justifiedRows(
+		files: PhotoItem[],
+		width: number
+	): Array<{ height: number; tiles: JustifiedTile[] }> {
+		const gap = 8;
+		const target = window.matchMedia('(max-width: 768px)').matches ? 150 : 200;
+		const rows: Array<{ height: number; tiles: JustifiedTile[] }> = [];
+		let cur: Array<{ file: PhotoItem; aspect: number }> = [];
+		let aspectSum = 0;
+		for (const file of files) {
+			let aspect = file.width && file.height ? file.width / file.height : 1;
+			if (!Number.isFinite(aspect) || aspect <= 0) aspect = 1;
+			aspect = Math.min(Math.max(aspect, 0.4), 3);
+			cur.push({ file, aspect });
+			aspectSum += aspect;
+			const rowWidth = aspectSum * target + (cur.length - 1) * gap;
+			if (rowWidth >= width) {
+				const h = (width - (cur.length - 1) * gap) / aspectSum;
+				rows.push({
+					height: Math.round(h),
+					tiles: cur.map((tt) => ({
+						file: tt.file,
+						w: Math.max(1, Math.round(tt.aspect * h)),
+						h: Math.round(h)
+					}))
+				});
+				cur = [];
+				aspectSum = 0;
+			}
+		}
+		if (cur.length) {
+			rows.push({
+				height: target,
+				tiles: cur.map((tt) => ({
+					file: tt.file,
+					w: Math.max(1, Math.round(tt.aspect * target)),
+					h: target
+				}))
+			});
+		}
+		return rows;
 	}
 
 	async function loadMore() {
@@ -102,7 +148,7 @@
 			cursor = page.nextCursor;
 			if (!page.nextCursor) exhausted = true;
 		} catch (e) {
-			error = errorMessage(e);
+			error = e instanceof Error ? e.message : String(e);
 			exhausted = true;
 		} finally {
 			loading = false;
@@ -115,10 +161,21 @@
 		if (typeof localStorage !== 'undefined') localStorage.setItem(GROUP_KEY, m);
 	}
 
+	function setLayoutMode(m: LayoutMode) {
+		if (layoutMode === m) return;
+		layoutMode = m;
+		if (typeof localStorage !== 'undefined') localStorage.setItem(LAYOUT_KEY, m);
+	}
+
 	/** A plain tile click toggles selection once anything is selected, else opens the lightbox. */
-	function onTileClick(p: FileItem) {
+	function onTileClick(p: PhotoItem) {
 		if (selected.size > 0) selected.toggle(p.id);
-		else openLightbox(p);
+		else lightbox = items.findIndex((x) => x.id === p.id);
+	}
+
+	function onDeletePhoto(id: string) {
+		items = items.filter((p) => p.id !== id);
+		selected.delete(id);
 	}
 
 	function downloadSelected() {
@@ -168,10 +225,10 @@
 	// When the server has no thumbnail for a video tile the <img> errors; we
 	// then extract a frame with the browser's native decoder and upload it.
 
-	async function generateVideoThumb(file: FileItem) {
+	async function generateVideoThumb(file: PhotoItem) {
 		if (videoThumbs[file.id]) return;
 		try {
-			const bitmap = await frameFromVideo(fileInlineUrl(file.id));
+			const bitmap = await frameFromVideo(`/api/files/${file.id}?inline=true`);
 			const SIZES: Array<['icon' | 'preview' | 'large', number, number]> = [
 				['icon', 150, 150],
 				['preview', 400, 400],
@@ -239,152 +296,15 @@
 		});
 	}
 
-	// ── Lightbox ─────────────────────────────────────────────────────────────
-	let lbShowingOriginal = $state(false);
-	let lbFullResBusy = $state(false);
-	let lbMeta = $state('');
-	let lbFavorited = $state(false);
-	/** Token guarding against stale async loads during rapid prev/next. */
-	let lbGeneration = 0;
-
-	const lbItem = $derived(lightbox >= 0 ? (items[lightbox] ?? null) : null);
-
-	function baseMeta(p: FileItem): string {
-		const dateStr = new Date(ts(p)).toLocaleDateString(undefined, {
-			year: 'numeric',
-			month: 'short',
-			day: 'numeric',
-			hour: '2-digit',
-			minute: '2-digit'
-		});
-		return p.size_formatted ? `${dateStr} · ${p.size_formatted}` : dateStr;
-	}
-
-	function applyMetadata(p: FileItem, md: FileMetadata) {
-		const parts = [baseMeta(p)];
-		if (md.camera_make || md.camera_model) {
-			parts.push([md.camera_make, md.camera_model].filter(Boolean).join(' '));
-		}
-		if (md.width && md.height) parts.push(`${md.width}×${md.height}`);
-		lbMeta = parts.join(' · ');
-	}
-
-	function openLightbox(p: FileItem) {
-		lightbox = items.findIndex((x) => x.id === p.id);
-	}
-
-	/** Reset per-item lightbox state and kick off metadata + neighbour preload. */
-	function showLightboxItem(p: FileItem) {
-		const generation = ++lbGeneration;
-		lbShowingOriginal = p.mime_type === 'image/gif';
-		lbFullResBusy = false;
-		lbFavorited = false;
-		lbMeta = baseMeta(p);
-		preloadNeighbors();
-		void fetchFileMetadata(p.id).then((md) => {
-			if (md && generation === lbGeneration) applyMetadata(p, md);
-		});
-	}
-
-	// Re-run per-item setup whenever the visible lightbox item changes.
-	$effect(() => {
-		if (lbItem) showLightboxItem(lbItem);
-	});
-
-	function preloadNeighbors() {
-		for (const i of [lightbox - 1, lightbox + 1]) {
-			const it = items[i];
-			if (it && !isVideo(it)) {
-				const pre = new Image();
-				pre.src = largeUrl(it.id);
-			}
-		}
-	}
-
-	/** The image src to display: large thumbnail first, original on expand/GIF. */
-	const lbImgSrc = $derived(
-		lbItem ? (lbShowingOriginal ? fileInlineUrl(lbItem.id) : largeUrl(lbItem.id)) : ''
-	);
-
-	function onLbImgError() {
-		if (!lbItem) return;
-		// Thumbnail missing → fall back to the original; original failing is terminal.
-		if (!lbShowingOriginal) {
-			lbShowingOriginal = true;
-		}
-	}
-
-	function onLbImgLoad() {
-		lbFullResBusy = false;
-	}
-
-	function expandFullRes() {
-		if (!lbItem || lbShowingOriginal) return;
-		lbShowingOriginal = true;
-		lbFullResBusy = true;
-	}
-
-	function lbDownload() {
-		if (!lbItem) return;
-		const a = document.createElement('a');
-		a.href = fileDownloadUrl(lbItem.id);
-		a.download = lbItem.name;
-		document.body.appendChild(a);
-		a.click();
-		a.remove();
-	}
-
-	async function lbToggleFavorite() {
-		if (!lbItem) return;
-		try {
-			await addFavorite('file', lbItem.id);
-			lbFavorited = !lbFavorited;
-		} catch (e) {
-			errorToast(e);
-		}
-	}
-
-	async function lbDelete() {
-		if (!lbItem) return;
-		const target = lbItem;
-		const ok = await confirmDialog({
-			title: t('photos.delete', 'Delete photo'),
-			message: t('photos.confirm_delete_one', { name: target.name }, 'Delete {{name}}?'),
-			confirmText: t('common.delete', 'Delete'),
-			danger: true
-		});
-		if (!ok) return;
-		try {
-			await deleteFile(target.id);
-			const at = items.findIndex((x) => x.id === target.id);
-			items = items.filter((x) => x.id !== target.id);
-			if (items.length === 0) {
-				lightbox = -1;
-			} else {
-				lightbox = Math.min(at, items.length - 1);
-			}
-		} catch (e) {
-			errorToast(e);
-		}
-	}
-
-	function lbPrev() {
-		if (lightbox > 0) lightbox -= 1;
-	}
-	function lbNext() {
-		if (lightbox >= 0 && lightbox < items.length - 1) lightbox += 1;
-	}
-	function onKeydown(e: KeyboardEvent) {
-		if (lightbox < 0) return;
-		if (e.key === 'Escape') lightbox = -1;
-		else if (e.key === 'ArrowLeft') lbPrev();
-		else if (e.key === 'ArrowRight') lbNext();
-	}
-
 	onMount(() => {
-		const saved = typeof localStorage !== 'undefined' ? localStorage.getItem(GROUP_KEY) : null;
-		if (saved === 'day' || saved === 'month' || saved === 'year') groupMode = saved;
+		const savedGroup = typeof localStorage !== 'undefined' ? localStorage.getItem(GROUP_KEY) : null;
+		if (savedGroup === 'day' || savedGroup === 'month' || savedGroup === 'year')
+			groupMode = savedGroup;
+		const savedLayout =
+			typeof localStorage !== 'undefined' ? localStorage.getItem(LAYOUT_KEY) : null;
+		if (savedLayout === 'square' || savedLayout === 'justified') layoutMode = savedLayout;
 		void loadMore();
+		void peopleEnabled().then((ok) => (peopleAvailable = ok));
 		if (!sentinel) return;
 		const obs = new IntersectionObserver(
 			(entries) => {
@@ -400,166 +320,163 @@
 </script>
 
 <svelte:head><title>{t('nav.photos', 'Photos')} · OxiCloud</title></svelte:head>
-<svelte:window onkeydown={onKeydown} />
 
 <div class="page-sticky-header photos-head">
 	<h1 class="page-title">{t('nav.photos', 'Photos')}</h1>
-	<div class="seg" role="group" aria-label={t('photos.group_by', 'Group by')}>
-		{#each MODES as m (m)}
-			<button class="seg__btn" class:active={groupMode === m} onclick={() => setGroupMode(m)}>
-				{t(`photos.${m}`, m)}
+	<div class="photos-subnav" role="tablist" aria-label={t('nav.photos', 'Photos')}>
+		<button
+			class="subnav__tab"
+			class:active={tab === 'moments'}
+			role="tab"
+			aria-selected={tab === 'moments'}
+			onclick={() => (tab = 'moments')}
+		>
+			{t('photos.tab_moments', 'Moments')}
+		</button>
+		<button
+			class="subnav__tab"
+			class:active={tab === 'places'}
+			role="tab"
+			aria-selected={tab === 'places'}
+			onclick={() => (tab = 'places')}
+		>
+			{t('photos.tab_places', 'Places')}
+		</button>
+		{#if peopleAvailable}
+			<button
+				class="subnav__tab"
+				class:active={tab === 'people'}
+				role="tab"
+				aria-selected={tab === 'people'}
+				onclick={() => (tab = 'people')}
+			>
+				{t('photos.tab_people', 'People')}
 			</button>
-		{/each}
+		{/if}
 	</div>
 </div>
 
-{#if selected.size > 0}
-	<div class="batch-bar">
-		<span>{t('files.selected_count', { n: selected.size }, '{{n}} selected')}</span>
-		<div class="batch-bar__actions">
-			<Button onclick={downloadSelected}>{t('common.download', 'Download')}</Button>
-			<Button onclick={() => selected.clear()}>{t('common.clear', 'Clear')}</Button>
-			<Button variant="danger" onclick={trashSelected}>{t('common.delete', 'Delete')}</Button>
-		</div>
-	</div>
-{/if}
-
-{#if error}
-	<p class="status status--error" role="alert">{error}</p>
-{:else if items.length === 0 && exhausted}
-	<EmptyState
-		icon="images"
-		title={t('photos.empty', 'No photos yet.')}
-		hint={t('photos.empty_hint', 'Photos and videos you upload will appear here, grouped by date.')}
-	/>
-{:else}
-	{#each groups as group (group.key)}
-		<h2 class="photos-group">
-			{group.label} <span class="photos-group__count">{group.photos.length}</span>
-		</h2>
-		<ul class="photos">
-			{#each group.photos as photo (photo.id)}
-				<li class="photos__cell" class:selected={selected.has(photo.id)}>
-					<button class="photos__open" onclick={() => onTileClick(photo)}>
-						{#if videoThumbs[photo.id]}
-							<img src={videoThumbs[photo.id]} alt={photo.name} loading="lazy" decoding="async" />
-						{:else}
-							<img
-								src={previewUrl(photo.id)}
-								srcset={`${iconUrl(photo.id)} 150w, ${previewUrl(photo.id)} 400w, ${largeUrl(photo.id)} 800w`}
-								sizes="(max-width: 768px) 33vw, 200px"
-								alt={photo.name}
-								loading="lazy"
-								decoding="async"
-								onerror={isVideo(photo) ? () => generateVideoThumb(photo) : undefined}
-							/>
-						{/if}
-						{#if isVideo(photo)}
-							<span class="photos__video-badge" aria-hidden="true"><Icon name="play" /></span>
-						{/if}
-					</button>
-					<button
-						class="photos__check"
-						class:on={selected.has(photo.id)}
-						aria-label={t('common.select', 'Select')}
-						onclick={() => selected.toggle(photo.id)}
-					>
-						<Icon name="check" />
-					</button>
-				</li>
+{#if tab === 'moments'}
+	<div class="photos-toolbar">
+		<div class="seg" role="group" aria-label={t('photos.group_by', 'Group by')}>
+			{#each MODES as m (m)}
+				<button class="seg__btn" class:active={groupMode === m} onclick={() => setGroupMode(m)}>
+					{t(`photos.${m}`, m)}
+				</button>
 			{/each}
-		</ul>
-	{/each}
-{/if}
-
-<div bind:this={sentinel} class="sentinel" aria-hidden="true"></div>
-{#if loading}<p class="status">{t('common.loading', 'Loading…')}</p>{/if}
-
-{#if lbItem}
-	<!-- svelte-ignore a11y_click_events_have_key_events -->
-	<div
-		class="lb"
-		role="dialog"
-		aria-modal="true"
-		aria-label={lbItem.name}
-		tabindex="-1"
-		onclick={(e) => e.target === e.currentTarget && (lightbox = -1)}
-	>
-		<div class="lb__info">
-			<div class="lb__filename">{lbItem.name}</div>
-			<div class="lb__meta">{lbMeta}</div>
 		</div>
-
-		<button
-			class="lb__close"
-			aria-label={t('common.close', 'Close')}
-			onclick={() => (lightbox = -1)}>×</button
-		>
-
-		<button
-			class="lb__nav lb__nav--prev"
-			aria-label={t('common.previous', 'Previous')}
-			disabled={lightbox === 0}
-			onclick={(e) => {
-				e.stopPropagation();
-				lbPrev();
-			}}><Icon name="chevron-left" /></button
-		>
-
-		<div class="lb__content">
-			{#if isVideo(lbItem)}
-				{#key lbItem.id}
-					<video class="lb__media" controls autoplay poster={largeUrl(lbItem.id)}>
-						<source src={fileInlineUrl(lbItem.id)} type={lbItem.mime_type} />
-					</video>
-				{/key}
-			{:else}
-				<img
-					class="lb__media"
-					src={lbImgSrc}
-					alt={lbItem.name}
-					onload={onLbImgLoad}
-					onerror={onLbImgError}
-				/>
-			{/if}
-		</div>
-
-		<button
-			class="lb__nav lb__nav--next"
-			aria-label={t('common.next', 'Next')}
-			disabled={lightbox === items.length - 1}
-			onclick={(e) => {
-				e.stopPropagation();
-				lbNext();
-			}}><Icon name="chevron-right" /></button
-		>
-
-		<div class="lb__toolbar">
-			{#if !isVideo(lbItem) && lbItem.mime_type !== 'image/gif' && !lbShowingOriginal}
-				<button
-					class="lb__tool"
-					title={t('photos.full_resolution', 'Full resolution')}
-					disabled={lbFullResBusy}
-					onclick={expandFullRes}><Icon name={lbFullResBusy ? 'spinner' : 'expand'} /></button
-				>
-			{/if}
-			<button class="lb__tool" title={t('common.download', 'Download')} onclick={lbDownload}
-				><Icon name="download" /></button
+		<div class="seg" role="group" aria-label={t('photos.layout_square', 'Layout')}>
+			<button
+				class="seg__btn"
+				class:active={layoutMode === 'square'}
+				title={t('photos.layout_square', 'Grid')}
+				aria-label={t('photos.layout_square', 'Grid')}
+				onclick={() => setLayoutMode('square')}><Icon name="th" /></button
 			>
 			<button
-				class="lb__tool"
-				class:active={lbFavorited}
-				title={t('common.favorite', 'Favorite')}
-				onclick={lbToggleFavorite}><Icon name={lbFavorited ? 'star' : 'star-outline'} /></button
-			>
-			<button class="lb__tool" title={t('common.delete', 'Delete')} onclick={lbDelete}
-				><Icon name="trash" /></button
+				class="seg__btn"
+				class:active={layoutMode === 'justified'}
+				title={t('photos.layout_justified', 'Justified')}
+				aria-label={t('photos.layout_justified', 'Justified')}
+				onclick={() => setLayoutMode('justified')}><Icon name="layer-group" /></button
 			>
 		</div>
-
-		<div class="lb__counter">{lightbox + 1} / {items.length}</div>
 	</div>
+
+	{#if selected.size > 0}
+		<div class="batch-bar">
+			<span>{t('files.selected_count', { n: selected.size }, '{{n}} selected')}</span>
+			<div class="batch-bar__actions">
+				<Button onclick={downloadSelected}>{t('common.download', 'Download')}</Button>
+				<Button onclick={() => selected.clear()}>{t('common.clear', 'Clear')}</Button>
+				<Button variant="danger" onclick={trashSelected}>{t('common.delete', 'Delete')}</Button>
+			</div>
+		</div>
+	{/if}
+
+	{#if error}
+		<p class="status status--error" role="alert">{error}</p>
+	{:else if items.length === 0 && exhausted}
+		<EmptyState
+			icon="images"
+			title={t('photos.empty', 'No photos yet.')}
+			hint={t(
+				'photos.empty_hint',
+				'Photos and videos you upload will appear here, grouped by date.'
+			)}
+		/>
+	{:else}
+		<div class="photos-area">
+			<div class="photos-measure" bind:clientWidth={gridWidth}>
+				{#each groups as group (group.key)}
+					<h2 class="photos-group">
+						{group.label} <span class="photos-group__count">{group.photos.length}</span>
+					</h2>
+					{#if layoutMode === 'justified' && gridWidth > 0}
+						{#each justifiedRows(group.photos, gridWidth) as row, ri (group.key + '-' + ri)}
+							<div class="photos-jrow" style:height="{row.height}px">
+								{#each row.tiles as cell (cell.file.id)}
+									{@render tile(cell.file, `width:${cell.w}px;height:${cell.h}px`)}
+								{/each}
+							</div>
+						{/each}
+					{:else}
+						<ul class="photos">
+							{#each group.photos as photo (photo.id)}
+								<li
+									class="photos__cell photos__cell--square"
+									class:selected={selected.has(photo.id)}
+								>
+									{@render tile(photo)}
+								</li>
+							{/each}
+						</ul>
+					{/if}
+				{/each}
+			</div>
+		</div>
+	{/if}
+
+	<div bind:this={sentinel} class="sentinel" aria-hidden="true"></div>
+	{#if loading}<p class="status">{t('common.loading', 'Loading…')}</p>{/if}
+
+	<PhotoLightbox {items} bind:index={lightbox} onDelete={onDeletePhoto} />
+{:else if tab === 'places'}
+	<PlacesMap />
+{:else if tab === 'people'}
+	<PeopleView />
 {/if}
+
+{#snippet tile(photo: PhotoItem, sizeStyle?: string)}
+	<div class="photo-tile" class:selected={selected.has(photo.id)} style={sizeStyle}>
+		<button class="photo-tile__open" onclick={() => onTileClick(photo)}>
+			{#if videoThumbs[photo.id]}
+				<img src={videoThumbs[photo.id]} alt={photo.name} loading="lazy" decoding="async" />
+			{:else}
+				<img
+					src={fileThumbnailUrl(photo.id, 'preview')}
+					srcset={`${fileThumbnailUrl(photo.id, 'icon')} 150w, ${fileThumbnailUrl(photo.id, 'preview')} 400w, ${fileThumbnailUrl(photo.id, 'large')} 800w`}
+					sizes="(max-width: 768px) 33vw, 200px"
+					alt={photo.name}
+					loading="lazy"
+					decoding="async"
+					onerror={isVideo(photo) ? () => generateVideoThumb(photo) : undefined}
+				/>
+			{/if}
+			{#if isVideo(photo)}
+				<span class="photo-tile__video-badge" aria-hidden="true"><Icon name="play" /></span>
+			{/if}
+		</button>
+		<button
+			class="photo-tile__check"
+			class:on={selected.has(photo.id)}
+			aria-label={t('common.select', 'Select')}
+			onclick={() => selected.toggle(photo.id)}
+		>
+			<Icon name="check" />
+		</button>
+	</div>
+{/snippet}
 
 <style>
 	.photos-head {
@@ -567,6 +484,7 @@
 		align-items: center;
 		justify-content: space-between;
 		gap: var(--space-3);
+		flex-wrap: wrap;
 		padding: 1rem 1rem 0;
 	}
 
@@ -574,6 +492,34 @@
 		margin: 0;
 		font-size: 1.5rem;
 		color: var(--color-text-heading);
+	}
+
+	.photos-subnav {
+		display: flex;
+		gap: var(--space-1);
+	}
+
+	.subnav__tab {
+		padding: var(--space-2) var(--space-3);
+		border: none;
+		border-bottom: 2px solid transparent;
+		background: none;
+		color: var(--color-text-muted);
+		cursor: pointer;
+		font-size: var(--text-base);
+	}
+
+	.subnav__tab.active {
+		color: var(--color-accent);
+		border-bottom-color: var(--color-accent);
+	}
+
+	.photos-toolbar {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		gap: var(--space-3);
+		padding: var(--space-3) 1rem 0;
 	}
 
 	.seg {
@@ -584,6 +530,8 @@
 	}
 
 	.seg__btn {
+		display: grid;
+		place-items: center;
 		padding: var(--space-2) var(--space-3);
 		border: none;
 		background: var(--color-bg-surface);
@@ -614,9 +562,12 @@
 		gap: var(--space-2);
 	}
 
+	.photos-area {
+		padding: 0 1rem;
+	}
+
 	.photos-group {
 		margin: var(--space-4) 0 var(--space-2);
-		padding: 0 1rem;
 		font-size: 1rem;
 		color: var(--color-text-heading);
 	}
@@ -630,26 +581,42 @@
 	.photos {
 		list-style: none;
 		margin: 0;
-		padding: 0 1rem;
+		padding: 0;
 		display: grid;
 		grid-template-columns: repeat(auto-fill, minmax(9rem, 1fr));
 		gap: 0.25rem;
 	}
 
-	.photos__cell {
+	/* Justified rows: a flex row of aspect-preserving tiles. */
+	.photos-jrow {
+		display: flex;
+		gap: 8px;
+		margin-bottom: 8px;
+	}
+
+	.photo-tile {
 		position: relative;
-		aspect-ratio: 1;
 		overflow: hidden;
 		border-radius: var(--radius-sm);
 		background: var(--color-bg-muted);
 	}
 
-	.photos__cell.selected {
+	.photos__cell--square,
+	.photos__cell--square .photo-tile {
+		aspect-ratio: 1;
+		height: 100%;
+	}
+
+	.photos__cell--square {
+		list-style: none;
+	}
+
+	.photo-tile.selected {
 		outline: 3px solid var(--color-accent);
 		outline-offset: -3px;
 	}
 
-	.photos__open {
+	.photo-tile__open {
 		display: block;
 		width: 100%;
 		height: 100%;
@@ -659,14 +626,14 @@
 		background: none;
 	}
 
-	.photos__open img {
+	.photo-tile__open img {
 		width: 100%;
 		height: 100%;
 		object-fit: cover;
 		display: block;
 	}
 
-	.photos__video-badge {
+	.photo-tile__video-badge {
 		position: absolute;
 		right: 6px;
 		bottom: 6px;
@@ -681,7 +648,7 @@
 		pointer-events: none;
 	}
 
-	.photos__check {
+	.photo-tile__check {
 		position: absolute;
 		top: 6px;
 		left: 6px;
@@ -698,12 +665,12 @@
 		transition: opacity 0.15s;
 	}
 
-	.photos__cell:hover .photos__check,
-	.photos__check.on {
+	.photo-tile:hover .photo-tile__check,
+	.photo-tile__check.on {
 		opacity: 1;
 	}
 
-	.photos__check.on {
+	.photo-tile__check.on {
 		background: var(--color-accent);
 		color: var(--color-on-accent);
 		border-color: var(--color-accent);
@@ -721,125 +688,5 @@
 
 	.sentinel {
 		height: 1px;
-	}
-
-	.lb {
-		position: fixed;
-		inset: 0;
-		z-index: 1000;
-		background: var(--color-lightbox-overlay);
-		display: flex;
-		align-items: center;
-		justify-content: center;
-	}
-
-	.lb__content {
-		max-width: 92vw;
-		max-height: 88vh;
-		display: flex;
-		align-items: center;
-		justify-content: center;
-	}
-
-	.lb__media {
-		max-width: 92vw;
-		max-height: 88vh;
-		object-fit: contain;
-	}
-
-	.lb__info {
-		position: absolute;
-		top: 1rem;
-		left: 1rem;
-		color: var(--color-on-accent);
-		max-width: 60vw;
-	}
-
-	.lb__filename {
-		font-weight: var(--weight-medium);
-		overflow: hidden;
-		text-overflow: ellipsis;
-		white-space: nowrap;
-	}
-
-	.lb__meta {
-		font-size: var(--text-sm);
-		opacity: 0.8;
-	}
-
-	.lb__close {
-		position: absolute;
-		top: 1rem;
-		right: 1rem;
-		font-size: 2rem;
-		line-height: 1;
-		background: none;
-		border: none;
-		color: var(--color-on-accent);
-		cursor: pointer;
-	}
-
-	.lb__nav {
-		position: absolute;
-		top: 50%;
-		transform: translateY(-50%);
-		font-size: 2rem;
-		background: none;
-		border: none;
-		color: var(--color-on-accent);
-		cursor: pointer;
-		padding: 1rem;
-	}
-
-	.lb__nav:disabled {
-		opacity: 0.3;
-		cursor: default;
-	}
-
-	.lb__nav--prev {
-		left: 0.5rem;
-	}
-
-	.lb__nav--next {
-		right: 0.5rem;
-	}
-
-	.lb__toolbar {
-		position: absolute;
-		bottom: 1rem;
-		left: 50%;
-		transform: translateX(-50%);
-		display: flex;
-		gap: var(--space-2);
-	}
-
-	.lb__tool {
-		width: 40px;
-		height: 40px;
-		border-radius: 50%;
-		border: none;
-		background: var(--color-scrim-control);
-		color: var(--color-on-accent);
-		cursor: pointer;
-		display: grid;
-		place-items: center;
-	}
-
-	.lb__tool:disabled {
-		opacity: 0.5;
-		cursor: default;
-	}
-
-	.lb__tool.active {
-		color: var(--color-accent);
-	}
-
-	.lb__counter {
-		position: absolute;
-		bottom: 1rem;
-		right: 1rem;
-		color: var(--color-on-accent);
-		font-size: var(--text-sm);
-		opacity: 0.8;
 	}
 </style>
