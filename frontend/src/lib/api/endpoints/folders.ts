@@ -48,6 +48,8 @@ export function getCachedFolder(folderId: string): CachedFolder | undefined {
 }
 
 export function cacheFolder(folderId: string, listing: FolderListing, etag?: string): void {
+	// Learn the children's names for breadcrumb resolution.
+	for (const f of listing.folders) rememberFolderName(f.id, f.name);
 	folderCache.delete(folderId);
 	folderCache.set(folderId, { listing, etag });
 	// Evict the least-recently-used entries past the cap.
@@ -62,6 +64,28 @@ export function cacheFolder(folderId: string, listing: FolderListing, etag?: str
 export function invalidateFolderCache(folderId?: string): void {
 	if (folderId === undefined) folderCache.clear();
 	else folderCache.delete(folderId);
+}
+
+// ── Folder name cache (breadcrumbs) ──────────────────────────────────────────
+// id → name, learned from every listing (a folder's listing names its children)
+// and from getFolder. Lets breadcrumbs resolve with zero requests during normal
+// navigation (each ancestor was named by its parent's listing); only a cold
+// deep-link fetches the names it hasn't seen.
+const FOLDER_NAMES_MAX = 1000;
+const folderNames = new Map<string, string>();
+
+export function rememberFolderName(id: string, name: string): void {
+	folderNames.delete(id);
+	folderNames.set(id, name);
+	while (folderNames.size > FOLDER_NAMES_MAX) {
+		const oldest = folderNames.keys().next().value;
+		if (oldest === undefined) break;
+		folderNames.delete(oldest);
+	}
+}
+
+export function getFolderName(id: string): string | undefined {
+	return folderNames.get(id);
 }
 
 function parseListing(raw: unknown): FolderListing {
@@ -84,8 +108,10 @@ export function listRootFolders(): Promise<FolderItem[]> {
 	return apiJson<FolderItem[]>('/api/folders', { credentials: 'same-origin' });
 }
 
-export function getFolder(id: string): Promise<FolderItem> {
-	return apiJson<FolderItem>(`/api/folders/${id}`, NO_CACHE);
+export async function getFolder(id: string): Promise<FolderItem> {
+	const folder = await apiJson<FolderItem>(`/api/folders/${id}`, NO_CACHE);
+	rememberFolderName(folder.id, folder.name);
+	return folder;
 }
 
 /**

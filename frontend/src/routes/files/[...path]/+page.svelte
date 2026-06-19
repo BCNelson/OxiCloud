@@ -12,8 +12,10 @@
 		fetchFolderListing,
 		getCachedFolder,
 		getFolder,
+		getFolderName,
 		invalidateFolderCache,
 		moveFolder,
+		rememberFolderName,
 		renameFolder,
 		type FolderListing
 	} from '$lib/api/endpoints/folders';
@@ -125,15 +127,21 @@
 	}
 
 	async function buildCrumbs(segments: string[]): Promise<Array<{ id: string; name: string }>> {
-		// Names for each id in the trail; tolerate failures with a fallback label.
-		const metas = await Promise.all(
-			segments.map((id) =>
-				getFolder(id)
-					.then((f) => ({ id, name: f.name }))
-					.catch(() => ({ id, name: '…' }))
-			)
+		// Names come from the cache first (every listing names its children, so
+		// step-by-step navigation needs zero requests); only ids we've never seen
+		// — a cold deep-link's ancestors — are fetched, in parallel.
+		return Promise.all(
+			segments.map(async (id) => {
+				const known = getFolderName(id);
+				if (known !== undefined) return { id, name: known };
+				try {
+					const f = await getFolder(id);
+					return { id, name: f.name };
+				} catch {
+					return { id, name: '…' };
+				}
+			})
 		);
-		return metas;
 	}
 
 	// Bumped on every load; a stale in-flight response checks this before it
@@ -329,7 +337,10 @@
 		if (!name || name === current) return;
 		try {
 			if (kind === 'file') await renameFile(id, name);
-			else await renameFolder(id, name);
+			else {
+				await renameFolder(id, name);
+				rememberFolderName(id, name); // keep breadcrumbs current immediately
+			}
 			await reload();
 		} catch (e) {
 			errorToast(e);

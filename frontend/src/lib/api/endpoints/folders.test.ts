@@ -2,12 +2,16 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 vi.mock('$lib/api/client', () => ({ apiFetch: vi.fn(), apiJson: vi.fn() }));
 
-import { apiFetch } from '$lib/api/client';
+import { apiFetch, apiJson } from '$lib/api/client';
+import type { FolderItem } from '$lib/api/types';
 import {
 	fetchFolderListing,
 	getCachedFolder,
 	cacheFolder,
 	invalidateFolderCache,
+	getFolder,
+	getFolderName,
+	rememberFolderName,
 	type FolderListing
 } from './folders';
 
@@ -104,5 +108,35 @@ describe('folder listing cache (LRU + invalidation)', () => {
 		expect(getCachedFolder('b')).toBeDefined();
 		invalidateFolderCache();
 		expect(getCachedFolder('b')).toBeUndefined();
+	});
+});
+
+describe('folder name cache (breadcrumbs)', () => {
+	const folder = (id: string, name: string): FolderItem => ({ id, name }) as unknown as FolderItem;
+
+	it("learns its children's names from a cached listing", () => {
+		cacheFolder('nc-parent', {
+			folders: [folder('nc-a', 'Alpha'), folder('nc-b', 'Beta')],
+			files: [],
+			favoriteIds: [],
+			sharedIds: []
+		});
+		expect(getFolderName('nc-a')).toBe('Alpha');
+		expect(getFolderName('nc-b')).toBe('Beta');
+		expect(getFolderName('nc-unknown')).toBeUndefined();
+	});
+
+	it('records the name fetched by getFolder', async () => {
+		vi.mocked(apiJson).mockResolvedValue(folder('gf-1', 'Reports') as never);
+		const f = await getFolder('gf-1');
+		expect(f.name).toBe('Reports');
+		expect(getFolderName('gf-1')).toBe('Reports');
+	});
+
+	it('rememberFolderName overwrites a stale name (e.g. after a rename)', () => {
+		rememberFolderName('rn-1', 'Old');
+		expect(getFolderName('rn-1')).toBe('Old');
+		rememberFolderName('rn-1', 'New');
+		expect(getFolderName('rn-1')).toBe('New');
 	});
 });
