@@ -6,7 +6,7 @@ use axum::{
     extract::{DefaultBodyLimit, State},
     http::StatusCode,
     response::{IntoResponse, Json as AxumJson, Response},
-    routing::{any, delete, get, post, put},
+    routing::{any, delete, get, patch, post, put},
 };
 use serde_json::json;
 use std::sync::Arc;
@@ -438,6 +438,24 @@ pub fn create_api_routes(app_state: &Arc<AppState>) -> Router<Arc<AppState>> {
         let photos_router = photos_router.with_state(app_state.clone());
 
         router = router.nest("/photos", photos_router);
+    }
+
+    // People (faces) routes — mounted only when OXICLOUD_ENABLE_FACES is on.
+    if app_state.people_service.is_some() {
+        use crate::interfaces::api::handlers::people_handler;
+
+        let people_router = Router::new()
+            .route("/", get(people_handler::list_people))
+            .route("/merge", post(people_handler::merge_people))
+            .route("/recluster", post(people_handler::recluster))
+            .route("/data", delete(people_handler::delete_all))
+            .route("/faces/{file_id}", get(people_handler::faces_for_file))
+            .route("/{id}", patch(people_handler::rename_person))
+            .route("/{id}/photos", get(people_handler::person_photos))
+            .route("/{id}/hide", post(people_handler::hide_person))
+            .with_state(app_state.clone());
+
+        router = router.nest("/people", people_router);
     }
 
     // Re-enable trash routes to make the trash view work
