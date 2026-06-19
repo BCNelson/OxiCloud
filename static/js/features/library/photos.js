@@ -56,6 +56,8 @@ const photosView = {
     _resizeHandler: null,
     /** @type {number} */
     _resizeTimer: 0,
+    /** @type {string|null} Anchor id for shift-range selection */
+    _selectAnchorId: null,
 
     PAGE_SIZE: 200,
 
@@ -202,6 +204,7 @@ const photosView = {
         // real elements so we keep references for the observer.
         this._container.innerHTML = this._renderToolbar();
         this._container.onclick = (e) => this._handleClick(e);
+        this._container.onkeydown = (e) => this._handleKeydown(e);
 
         const groups = this._groupItems(this.items);
         for (const [label, files] of groups) {
@@ -436,7 +439,7 @@ const photosView = {
         const selected = this.selected.has(file.id) ? ' selected' : '';
         const cachedThumb = isVideo && this._videoThumbCache.has(file.id) ? this._videoThumbCache.get(file.id) : null;
         const thumbUrl = cachedThumb || `/api/files/${file.id}/thumbnail/preview`;
-        let h = `<div class="photo-tile${selected}" data-id="${this._escAttr(file.id)}" data-mime="${this._escAttr(file.mime_type)}" data-name="${this._escAttr(file.name)}">`;
+        let h = `<div class="photo-tile${selected}" data-id="${this._escAttr(file.id)}" data-mime="${this._escAttr(file.mime_type)}" data-name="${this._escAttr(file.name)}" tabindex="0" role="button" aria-label="${this._escAttr(file.name)}">`;
         h += `<div class="photo-check"><i class="fas fa-check"></i></div>`;
         const srcset = cachedThumb
             ? ''
@@ -599,9 +602,16 @@ const photosView = {
         const id = tile.dataset.id;
         const check = target.closest('.photo-check');
 
+        // Shift-click extends the selection from the last anchor.
+        if (id && e.shiftKey && this._selectAnchorId) {
+            this._selectRange(this._selectAnchorId, id);
+            return;
+        }
+
         // If clicking checkbox or in selection mode, toggle select
         if (check || this.selected.size > 0) {
             this._toggleSelect(id, tile);
+            this._selectAnchorId = id || null;
             return;
         }
 
@@ -610,6 +620,49 @@ const photosView = {
         if (idx >= 0) {
             photosLightbox.open(this.items, idx);
         }
+    },
+
+    /**
+     * Select every item between the anchor and the target (inclusive), in
+     * timeline order. Tracked in the Set so it survives dematerialized
+     * groups; currently-visible tiles get the class applied immediately.
+     * @param {string} anchorId
+     * @param {string} toId
+     */
+    _selectRange(anchorId, toId) {
+        const a = this.items.findIndex((f) => f.id === anchorId);
+        const b = this.items.findIndex((f) => f.id === toId);
+        if (a < 0 || b < 0) return;
+        const lo = Math.min(a, b);
+        const hi = Math.max(a, b);
+        for (let i = lo; i <= hi; i++) this.selected.add(this.items[i].id);
+        this._container?.querySelectorAll('.photo-tile').forEach((el) => {
+            const t = /** @type {HTMLElement} */ (el);
+            if (t.dataset.id && this.selected.has(t.dataset.id)) t.classList.add('selected');
+        });
+        this._selectAnchorId = toId;
+        this._updateSelectionBar();
+    },
+
+    /**
+     * Keyboard activation for focused tiles: Enter opens the lightbox (or
+     * toggles selection when in selection mode); Space toggles selection.
+     * @param {KeyboardEvent} e
+     */
+    _handleKeydown(e) {
+        if (e.key !== 'Enter' && e.key !== ' ') return;
+        const target = /** @type {Element} */ (e.target);
+        const tile = /** @type {HTMLDivElement} */ (target.closest('.photo-tile'));
+        if (!tile) return;
+        e.preventDefault();
+        const id = tile.dataset.id;
+        if (e.key === ' ' || this.selected.size > 0) {
+            this._toggleSelect(id, tile);
+            this._selectAnchorId = id || null;
+            return;
+        }
+        const idx = this.items.findIndex((f) => f.id === id);
+        if (idx >= 0) photosLightbox.open(this.items, idx);
     },
 
     /**
