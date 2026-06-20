@@ -669,6 +669,8 @@
 	}
 
 	.rl-ctx-item--danger {
-		color: var(--color-danger-text);
+		/* Danger *foreground* on the light menu surface — the red accent, not
+		   --color-danger-text (white, for text ON a red fill, invisible here). */
+		color: var(--color-danger-alt);
 	}
 </style>

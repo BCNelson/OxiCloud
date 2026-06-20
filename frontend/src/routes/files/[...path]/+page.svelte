@@ -2074,6 +2074,9 @@
 	}
 
 	.ctx-item--danger {
-		color: var(--color-danger-text);
+		/* Danger *foreground* on the light menu surface — must be the red accent,
+		   not --color-danger-text (which is white, for text ON a red fill, and
+		   rendered near-invisible here). Mirrors the user-menu logout red. */
+		color: var(--color-danger-alt);
 	}
 </style>
