@@ -30,8 +30,12 @@ const SLICE_BYTES = 8 * 1024 * 1024;
 const NEGOTIATE_BATCH = 256;
 /** Group missing chunks into PUT bodies of at most this many bytes. */
 const UPLOAD_BATCH_BYTES = 8 * 1024 * 1024;
-/** Concurrent chunk-PUT requests. */
-const UPLOAD_CONCURRENCY = 2;
+/** Concurrent chunk-PUT requests. Kept at 1: several folder files upload through
+ *  their own workers at once, and the browser only grants ~6 connections per
+ *  host. Combined with serialized negotiate (below) each worker holds at most
+ *  ~2 connections (one negotiate + one chunk PUT), so a couple of concurrent
+ *  large files can't starve the plain uploads of the small ones. */
+const UPLOAD_CONCURRENCY = 1;
 /** Re-commit attempts when the server answers 409 still_missing. */
 const COMMIT_RETRIES = 2;
 
@@ -175,37 +179,44 @@ workerScope.onmessage = async (event) => {
     for (let i = 0; i < UPLOAD_CONCURRENCY; i++) uploadWorkers.push(uploadLoop());
 
     // ── Negotiate stage ───────────────────────────────────────────
+    // Serialized: each negotiate awaits the previous one, so at most a single
+    // negotiate request is ever in flight per worker. Together with the single
+    // chunk-PUT lane (UPLOAD_CONCURRENCY = 1) this caps the worker at ~2
+    // concurrent connections, leaving room under the browser's ~6-per-host
+    // budget for the other folder files uploading in parallel.
     /** @type {Promise<void>[]} */
     const negotiations = [];
+    let negotiateTail = Promise.resolve();
     const negotiate = (/** @type {WorkerChunk[]} */ fresh) => {
         if (fresh.length === 0 || failed) return;
-        negotiations.push(
-            (async () => {
-                try {
-                    const response = await fetch('/api/files/delta/negotiate', {
-                        method: 'POST',
-                        headers: mutHeaders,
-                        body: JSON.stringify({ chunks: fresh.map(({ h, s }) => ({ h, s })) })
-                    });
-                    if (!response.ok) {
-                        failed = failed || `negotiate failed (HTTP ${response.status})`;
-                        return;
-                    }
-                    const missing = new Set(/** @type {{missing: string[]}} */ (await response.json()).missing);
-                    for (const c of fresh) {
-                        if (missing.has(c.h)) {
-                            uploadQueue.push(c);
-                        } else {
-                            reusedBytes += c.s;
-                        }
-                    }
-                    signalUploaders();
-                    progress();
-                } catch (err) {
-                    failed = failed || `negotiate failed: ${err instanceof Error ? err.message : String(err)}`;
+        const run = negotiateTail.then(async () => {
+            if (failed) return;
+            try {
+                const response = await fetch('/api/files/delta/negotiate', {
+                    method: 'POST',
+                    headers: mutHeaders,
+                    body: JSON.stringify({ chunks: fresh.map(({ h, s }) => ({ h, s })) })
+                });
+                if (!response.ok) {
+                    failed = failed || `negotiate failed (HTTP ${response.status})`;
+                    return;
                 }
-            })()
-        );
+                const missing = new Set(/** @type {{missing: string[]}} */ (await response.json()).missing);
+                for (const c of fresh) {
+                    if (missing.has(c.h)) {
+                        uploadQueue.push(c);
+                    } else {
+                        reusedBytes += c.s;
+                    }
+                }
+                signalUploaders();
+                progress();
+            } catch (err) {
+                failed = failed || `negotiate failed: ${err instanceof Error ? err.message : String(err)}`;
+            }
+        });
+        negotiateTail = run.catch(() => {});
+        negotiations.push(run);
     };
 
     // ── Chunking stage (drives the other two) ────────────────────
