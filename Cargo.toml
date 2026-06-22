@@ -174,6 +174,31 @@ name = "bench_blob_manifest"
 path = "examples/bench_blob_manifest.rs"
 required-features = ["bench"]
 
+# Blob download read-ahead benchmark — sweeps the local backend's chunk prefetch
+# depth (read_prefetch / buffered(N)) under disk-bound vs network-bound consumers
+# and warm vs cold page cache. No Postgres needed.
+[[example]]
+name = "bench_blob_prefetch"
+path = "examples/bench_blob_prefetch.rs"
+required-features = ["bench"]
+
+# Tokio runtime tuning benchmark — worker over-subscription (throughput + p99
+# under CPU contention) and blocking-pool RSS blast radius, default vs tuned.
+# No Postgres needed; run under `taskset -c 0,1` to model a 2-core quota.
+[[example]]
+name = "bench_tokio_runtime"
+path = "examples/bench_tokio_runtime.rs"
+required-features = ["bench"]
+
+# CPU pool concurrency benchmark — thumbnail decode throughput + p99 as the
+# decode-permit count is swept, showing the effect of sizing the image pools to
+# the CFS quota (effective_parallelism) vs the host core count. No Postgres;
+# run under `taskset -c 0,1` to model a 2-core quota.
+[[example]]
+name = "bench_pool_concurrency"
+path = "examples/bench_pool_concurrency.rs"
+required-features = ["bench"]
+
 # ACL owner-cache benchmark — owner query vs moka hit (needs the dev Postgres up).
 [[example]]
 name = "bench_owner_cache"
