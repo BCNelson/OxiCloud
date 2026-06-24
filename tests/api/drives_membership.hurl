@@ -704,30 +704,19 @@ HTTP 404
 
 
 # 26d — Editor renames the drive (root folder) → 404.
-#       Editor bundle has Update on content, but the rename
-#       endpoint uses authz.require(...) and Editor's bundle on
-#       the drive root resolves through the same drive precheck.
-#       Editor has Update; folder rename uses Update; so this
-#       should actually SUCCEED. Asserting 200 to reflect the
-#       real engine semantics — the "Editor can rename the drive"
-#       fact is a real product question worth surfacing here.
-#       If you want rename to be Owner-only, the fix is in the
-#       folder service (require Manage, not Update).
+#       Folder rename normally requires `Permission::Update` (which
+#       Editor has on every folder in the drive via the engine's drive
+#       precheck). The folder service promotes the requirement to
+#       `Permission::Manage` when the target folder has `parent_id IS
+#       NULL` — i.e. it's a drive root — so the drive-rename surface is
+#       Owner-only per drive.md §6, without changing the public folder
+#       endpoint shape. Anti-enum: refusal returns 404 (not 403).
 PUT {{base_url}}/api/folders/{{team_root_folder_id}}/rename
 Authorization: Bearer {{bob_token}}
 Content-Type: application/json
 { "name": "team-drive-editor-renamed" }
 
-HTTP 200
-
-
-# Restore the previous name so downstream assertions don't drift.
-PUT {{base_url}}/api/folders/{{team_root_folder_id}}/rename
-Authorization: Bearer {{alice_token}}
-Content-Type: application/json
-{ "name": "team-drive-renamed" }
-
-HTTP 200
+HTTP 404
 
 
 # ─────────────────────────────────────────────────────────────

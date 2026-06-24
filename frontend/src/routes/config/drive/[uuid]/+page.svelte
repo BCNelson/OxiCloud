@@ -4,6 +4,8 @@
 	import { onMount } from 'svelte';
 
 	import { listDriveMembers } from '$lib/api/endpoints/drives';
+	import { renameFolder } from '$lib/api/endpoints/folders';
+	import { errorToast } from '$lib/utils/errors';
 	import type { Drive, DriveMember, DriveRole } from '$lib/api/types';
 	import ShareDialog from '$lib/components/ShareDialog.svelte';
 	import UserVignette from '$lib/components/UserVignette.svelte';
@@ -25,6 +27,55 @@
 	// backend guard refuses), so the UI hides the controls upfront for
 	// honest UX. Shared drives + Owner role → full controls.
 	const canManageMembers = $derived(drive?.kind === 'shared' && drive?.caller_role === 'owner');
+
+	// Rename is allowed for any Owner (both shared and personal), since
+	// the backend requires `Permission::Manage` on the drive's root
+	// folder which only the Owner bundle carries. Personal-drive Owners
+	// are the user themselves (seeded by the lifecycle hook).
+	const canRename = $derived(drive?.caller_role === 'owner');
+
+	// Inline rename state. `renameDraft` shadows `drive.name` while the
+	// input is open; we don't write back to the store until the server
+	// accepts the change. `renameBusy` disables the save/cancel buttons
+	// during the round-trip.
+	let renaming = $state(false);
+	let renameDraft = $state('');
+	let renameBusy = $state(false);
+
+	function startRename() {
+		if (!drive) return;
+		renameDraft = drive.name;
+		renaming = true;
+	}
+
+	function cancelRename() {
+		renaming = false;
+		renameDraft = '';
+	}
+
+	async function saveRename() {
+		if (!drive) return;
+		const next = renameDraft.trim();
+		if (next.length === 0 || next === drive.name) {
+			cancelRename();
+			return;
+		}
+		renameBusy = true;
+		try {
+			// Drive name = root folder name (drive.md §3); rename via the
+			// folder endpoint. Backend promotes the perm to Manage for
+			// parent_id IS NULL, so a non-Owner caller would 404 here
+			// (but the UI also hid this button for non-Owners).
+			await renameFolder(drive.root_folder_id, next);
+			drivesStore.invalidate();
+			await drivesStore.load();
+			renaming = false;
+		} catch (e) {
+			errorToast(e);
+		} finally {
+			renameBusy = false;
+		}
+	}
 
 	function roleLabel(role: DriveRole): string {
 		switch (role) {
@@ -153,10 +204,59 @@
 			<a class="link" href={resolve('/files')}>{t('drive.back_to_files', 'Back to Files')}</a>
 		</div>
 	{:else}
-		<h1>
+		<div class="drive-title">
 			<Icon name={driveIcon(drive)} />
-			{drive.name}
-		</h1>
+			{#if renaming}
+				<input
+					class="drive-title__input"
+					type="text"
+					data-testid="drive-rename-input"
+					bind:value={renameDraft}
+					maxlength="200"
+					disabled={renameBusy}
+					onkeydown={(e) => {
+						if (e.key === 'Enter') void saveRename();
+						else if (e.key === 'Escape') cancelRename();
+					}}
+				/>
+				<button
+					type="button"
+					class="icon-btn"
+					data-testid="drive-rename-save-btn"
+					title={t('common.save', 'Save')}
+					aria-label={t('common.save', 'Save')}
+					onclick={() => void saveRename()}
+					disabled={renameBusy}
+				>
+					<Icon name="check" />
+				</button>
+				<button
+					type="button"
+					class="icon-btn"
+					data-testid="drive-rename-cancel-btn"
+					title={t('common.cancel', 'Cancel')}
+					aria-label={t('common.cancel', 'Cancel')}
+					onclick={cancelRename}
+					disabled={renameBusy}
+				>
+					<Icon name="times" />
+				</button>
+			{:else}
+				<h1 class="drive-title__name">{drive.name}</h1>
+				{#if canRename}
+					<button
+						type="button"
+						class="icon-btn"
+						data-testid="drive-rename-edit-btn"
+						title={t('drive.rename', 'Rename drive')}
+						aria-label={t('drive.rename', 'Rename drive')}
+						onclick={startRename}
+					>
+						<Icon name="pencil-alt" />
+					</button>
+				{/if}
+			{/if}
+		</div>
 
 		<div class="card">
 			<h2><Icon name="info-circle" /> {t('drive.info', 'Drive info')}</h2>
@@ -400,6 +500,54 @@
 
 	.link:hover {
 		text-decoration: underline;
+	}
+
+	/* Drive title row: icon + name (or inline rename input) + edit/save
+	   affordances. Mirrors the visual weight of the previous static
+	   <h1> so the page layout doesn't shift when entering rename mode. */
+	.drive-title {
+		display: flex;
+		align-items: center;
+		gap: 0.5rem;
+		margin-bottom: 1rem;
+	}
+
+	.drive-title__name {
+		margin: 0;
+	}
+
+	.drive-title__input {
+		flex: 1;
+		min-width: 0;
+		max-width: 28rem;
+		padding: 0.4rem 0.6rem;
+		font-size: 1.5rem;
+		font-weight: var(--weight-semibold, 600);
+		border: 1px solid var(--color-border);
+		border-radius: var(--radius-md);
+		background: var(--color-bg-input);
+		color: var(--color-text);
+	}
+
+	/* Compact icon button used in the title row + nowhere else here.
+	   The shared `.icon-btn` style isn't promoted to a global yet, so
+	   we duplicate the minimum that this page needs. */
+	.icon-btn {
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		width: 2rem;
+		height: 2rem;
+		border: 1px solid var(--color-border);
+		border-radius: var(--radius-md);
+		background: var(--color-bg-surface);
+		color: var(--color-text);
+		cursor: pointer;
+	}
+
+	.icon-btn:disabled {
+		opacity: 0.45;
+		cursor: not-allowed;
 	}
 
 	/* Members card header: title on the left, "Manage members" button on
