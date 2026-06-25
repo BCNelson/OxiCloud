@@ -877,60 +877,48 @@ impl FileHandler {
         }
 
         // ── Range Requests ───────────────────────────────────────────
-        if let Some(range_header) = headers.get(header::RANGE)
-            && let Ok(range_str) = range_header.to_str()
-            && let Ok(ranges) = parse_range_header(range_str)
-        {
-            match ranges.validate(stat.size) {
-                Ok(valid_ranges) => {
-                    if let Some(range) = valid_ranges.first() {
-                        let start = *range.start();
-                        let end = *range.end();
-                        let range_length = end - start + 1;
-                        let disposition = Self::content_disposition(name, &stat.mime_type, params);
-                        match retrieval
-                            .open_mount_file_with_perms(
-                                cfg,
-                                node_id,
-                                caller_id,
-                                Some((start, Some(end))),
+        let range_header = headers.get(header::RANGE).and_then(|v| v.to_str().ok());
+        match plan_mount_range(stat.size, range_header) {
+            MountRangePlan::Full => {}
+            MountRangePlan::NotSatisfiable => {
+                return Response::builder()
+                    .status(StatusCode::RANGE_NOT_SATISFIABLE)
+                    .header(header::CONTENT_RANGE, format!("bytes */{}", stat.size))
+                    .body(Body::empty())
+                    .unwrap()
+                    .into_response();
+            }
+            MountRangePlan::Range { start, end } => {
+                let range_length = end - start + 1;
+                let disposition = Self::content_disposition(name, &stat.mime_type, params);
+                match retrieval
+                    .open_mount_file_with_perms(cfg, node_id, caller_id, Some((start, Some(end))))
+                    .await
+                {
+                    Ok(stream) => {
+                        return Response::builder()
+                            .status(StatusCode::PARTIAL_CONTENT)
+                            .header(header::CONTENT_TYPE, &stat.mime_type)
+                            .header(header::CONTENT_DISPOSITION, &disposition)
+                            .header(header::CONTENT_LENGTH, range_length)
+                            .header(
+                                header::CONTENT_RANGE,
+                                format!("bytes {}-{}/{}", start, end, stat.size),
                             )
-                            .await
-                        {
-                            Ok(stream) => {
-                                return Response::builder()
-                                    .status(StatusCode::PARTIAL_CONTENT)
-                                    .header(header::CONTENT_TYPE, &stat.mime_type)
-                                    .header(header::CONTENT_DISPOSITION, &disposition)
-                                    .header(header::CONTENT_LENGTH, range_length)
-                                    .header(
-                                        header::CONTENT_RANGE,
-                                        format!("bytes {}-{}/{}", start, end, stat.size),
-                                    )
-                                    .header(header::ACCEPT_RANGES, "bytes")
-                                    .header(header::ETAG, &etag)
-                                    .header(
-                                        header::CACHE_CONTROL,
-                                        "private, max-age=3600, must-revalidate",
-                                    )
-                                    .body(Body::from_stream(stream))
-                                    .unwrap()
-                                    .into_response();
-                            }
-                            Err(err) => {
-                                tracing::error!("Error creating mount range stream: {}", err);
-                                // fall through to full download
-                            }
-                        }
+                            .header(header::ACCEPT_RANGES, "bytes")
+                            .header(header::ETAG, &etag)
+                            .header(
+                                header::CACHE_CONTROL,
+                                "private, max-age=3600, must-revalidate",
+                            )
+                            .body(Body::from_stream(stream))
+                            .unwrap()
+                            .into_response();
                     }
-                }
-                Err(_) => {
-                    return Response::builder()
-                        .status(StatusCode::RANGE_NOT_SATISFIABLE)
-                        .header(header::CONTENT_RANGE, format!("bytes */{}", stat.size))
-                        .body(Body::empty())
-                        .unwrap()
-                        .into_response();
+                    Err(err) => {
+                        tracing::error!("Error creating mount range stream: {}", err);
+                        // fall through to full download
+                    }
                 }
             }
         }
@@ -1542,4 +1530,94 @@ pub async fn move_file_simple(
     json: Json<serde_json::Value>,
 ) -> impl IntoResponse {
     FileHandler::move_file_simple_impl(state, auth_user, path, json).await
+}
+
+/// The download decision for a mount file given a `Range` header — the gnarly
+/// parse-and-validate logic, extracted so it is unit-testable without I/O.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum MountRangePlan {
+    /// Serve the whole file (no/invalid range header).
+    Full,
+    /// Serve `start..=end` (inclusive) as 206 Partial Content.
+    Range { start: u64, end: u64 },
+    /// The requested range is unsatisfiable for this size → 416.
+    NotSatisfiable,
+}
+
+/// Decide how to serve a mount file for a given size + optional `Range` header.
+/// A missing or unparseable range → `Full`; a valid range → `Range`; an
+/// out-of-bounds range → `NotSatisfiable`.
+pub(super) fn plan_mount_range(size: u64, range_header: Option<&str>) -> MountRangePlan {
+    let Some(rh) = range_header else {
+        return MountRangePlan::Full;
+    };
+    let Ok(ranges) = parse_range_header(rh) else {
+        // Malformed range header: ignore it and serve the whole file (RFC 7233).
+        return MountRangePlan::Full;
+    };
+    match ranges.validate(size) {
+        Ok(valid) => match valid.first() {
+            Some(r) => MountRangePlan::Range {
+                start: *r.start(),
+                end: *r.end(),
+            },
+            None => MountRangePlan::Full,
+        },
+        Err(_) => MountRangePlan::NotSatisfiable,
+    }
+}
+
+#[cfg(test)]
+mod mount_range_tests {
+    use super::{MountRangePlan, plan_mount_range};
+
+    #[test]
+    fn no_range_header_is_full() {
+        assert_eq!(plan_mount_range(100, None), MountRangePlan::Full);
+    }
+
+    #[test]
+    fn malformed_range_falls_back_to_full() {
+        assert_eq!(
+            plan_mount_range(100, Some("not-a-range")),
+            MountRangePlan::Full
+        );
+        assert_eq!(
+            plan_mount_range(100, Some("bytes=abc")),
+            MountRangePlan::Full
+        );
+    }
+
+    #[test]
+    fn valid_range_is_parsed_inclusive() {
+        assert_eq!(
+            plan_mount_range(100, Some("bytes=10-19")),
+            MountRangePlan::Range { start: 10, end: 19 }
+        );
+    }
+
+    #[test]
+    fn open_ended_range_extends_to_eof() {
+        assert_eq!(
+            plan_mount_range(100, Some("bytes=90-")),
+            MountRangePlan::Range { start: 90, end: 99 }
+        );
+    }
+
+    #[test]
+    fn suffix_range_counts_from_end() {
+        // last 10 bytes of a 100-byte file => 90..=99
+        assert_eq!(
+            plan_mount_range(100, Some("bytes=-10")),
+            MountRangePlan::Range { start: 90, end: 99 }
+        );
+    }
+
+    #[test]
+    fn out_of_bounds_range_is_not_satisfiable() {
+        assert_eq!(
+            plan_mount_range(100, Some("bytes=200-300")),
+            MountRangePlan::NotSatisfiable
+        );
+    }
 }
