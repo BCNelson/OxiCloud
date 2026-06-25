@@ -6,7 +6,10 @@ use crate::application::dtos::folder_dto::{
 use crate::application::ports::authorization_ports::AuthorizationEngine;
 use crate::application::ports::external_mount_ports::MountEntry;
 use crate::application::ports::folder_ports::FolderUseCase;
-use crate::application::services::external_mount_router::MountRouter;
+use crate::application::services::external_mount_router::{MountRouter, ResolvedId};
+use crate::application::services::mount_dto::{
+    audit_mount_write, mount_folder_dto, mount_parent_id,
+};
 use crate::application::services::mount_registry::MountConfig;
 use crate::common::errors::{DomainError, ErrorKind};
 use crate::domain::repositories::folder_repository::FolderRepository;
@@ -45,6 +48,45 @@ impl FolderService {
     /// treating an id as a native UUID).
     pub fn mount_router(&self) -> &MountRouter {
         &self.mount_router
+    }
+
+    /// Authorize a mutation inside a mount. All operations within a mount gate
+    /// on the mount-root folder grant (the `cfg.mount_id` resource).
+    async fn require_mount_perm(
+        &self,
+        cfg: &MountConfig,
+        perm: Permission,
+        caller_id: Uuid,
+    ) -> Result<(), DomainError> {
+        self.authz
+            .require(
+                Subject::User(caller_id),
+                perm,
+                Resource::Folder(cfg.mount_id),
+            )
+            .await
+    }
+
+    /// Resolve a move destination within the SAME mount as `cfg`, returning the
+    /// destination parent's node id. Errors (`UnsupportedOperation`) if the
+    /// destination is absent, native, or in a different mount.
+    fn mount_dest_node(
+        &self,
+        cfg: &MountConfig,
+        parent_id: Option<&str>,
+    ) -> Result<NodeId, DomainError> {
+        let Some(parent_id) = parent_id else {
+            return Err(cross_boundary_move_err());
+        };
+        match self.mount_router.classify(parent_id) {
+            ResolvedId::MountRoot { cfg: dest } if dest.mount_id == cfg.mount_id => {
+                Ok(NodeId::default())
+            }
+            ResolvedId::MountChild { cfg: dest, node_id } if dest.mount_id == cfg.mount_id => {
+                Ok(node_id)
+            }
+            _ => Err(cross_boundary_move_err()),
+        }
     }
 
     /// Batch counterpart of `get_folder`: resolve many folder ids in ONE
@@ -232,6 +274,29 @@ impl FolderUseCase for FolderService {
                 "Root folder creation is reserved for registration",
             ));
         };
+
+        // External mount: create the directory on the provider, not in PG.
+        match self.mount_router.classify(parent_id) {
+            ResolvedId::Regular => {}
+            ResolvedId::MountRoot { cfg } => {
+                self.require_mount_perm(&cfg, Permission::Create, caller_id)
+                    .await?;
+                let stat = cfg
+                    .provider
+                    .create_dir(&NodeId::default(), &dto.name)
+                    .await?;
+                audit_mount_write("mkdir", &cfg, caller_id, stat.node_id.as_str());
+                return Ok(mount_folder_dto(&cfg, parent_id, &stat));
+            }
+            ResolvedId::MountChild { cfg, node_id } => {
+                self.require_mount_perm(&cfg, Permission::Create, caller_id)
+                    .await?;
+                let stat = cfg.provider.create_dir(&node_id, &dto.name).await?;
+                audit_mount_write("mkdir", &cfg, caller_id, stat.node_id.as_str());
+                return Ok(mount_folder_dto(&cfg, parent_id, &stat));
+            }
+        }
+
         let parent_resource = Self::folder_resource(parent_id)?;
         self.authz
             .require(
@@ -464,6 +529,26 @@ impl FolderUseCase for FolderService {
             )));
         }
 
+        // External mount: rename on the provider. The mount root cannot be
+        // renamed through here (it's a real folder row managed elsewhere).
+        match self.mount_router.classify(id) {
+            ResolvedId::Regular => {}
+            ResolvedId::MountRoot { .. } => {
+                return Err(DomainError::operation_not_supported(
+                    "Folder",
+                    "a mount root cannot be renamed through this endpoint",
+                ));
+            }
+            ResolvedId::MountChild { cfg, node_id } => {
+                self.require_mount_perm(&cfg, Permission::Update, caller_id)
+                    .await?;
+                let stat = cfg.provider.rename(&node_id, &dto.name).await?;
+                let parent = mount_parent_id(&cfg, stat.node_id.as_str());
+                audit_mount_write("rename", &cfg, caller_id, stat.node_id.as_str());
+                return Ok(mount_folder_dto(&cfg, &parent, &stat));
+            }
+        }
+
         // Drive roots double as the drive's display name (per drive.md §3,
         // `drives.name` is sourced from `storage.folders.name` of the row
         // pointed at by `root_folder_id`). Per drive.md §6 the rename is
@@ -516,6 +601,37 @@ impl FolderUseCase for FolderService {
         dto: MoveFolderDto,
         caller_id: Uuid,
     ) -> Result<FolderDto, DomainError> {
+        // External mount: moves must stay within a single mount. The provider
+        // relocates; cross-backend moves (mount ↔ native, or between mounts) are
+        // forbidden in v1.
+        match self.mount_router.classify(id) {
+            ResolvedId::Regular => {
+                // Native source: forbid moving INTO a mount.
+                if let Some(parent_id) = &dto.parent_id
+                    && self.mount_router.is_mount_id(parent_id)
+                {
+                    return Err(cross_boundary_move_err());
+                }
+            }
+            ResolvedId::MountRoot { .. } => {
+                return Err(DomainError::operation_not_supported(
+                    "Folder",
+                    "a mount root cannot be moved",
+                ));
+            }
+            ResolvedId::MountChild { cfg, node_id } => {
+                let dest = self.mount_dest_node(&cfg, dto.parent_id.as_deref())?;
+                self.require_mount_perm(&cfg, Permission::Update, caller_id)
+                    .await?;
+                self.require_mount_perm(&cfg, Permission::Create, caller_id)
+                    .await?;
+                let stat = cfg.provider.move_within(&node_id, &dest).await?;
+                audit_mount_write("move", &cfg, caller_id, stat.node_id.as_str());
+                let parent = mount_parent_id(&cfg, stat.node_id.as_str());
+                return Ok(mount_folder_dto(&cfg, &parent, &stat));
+            }
+        }
+
         let source_resource = Self::folder_resource(id)?;
         self.authz
             .require(
@@ -564,6 +680,25 @@ impl FolderUseCase for FolderService {
     /// The DB trigger `trg_cleanup_grants_folder` cleans up `access_grants`
     /// rows targeting the deleted folder automatically.
     async fn delete_folder_with_perms(&self, id: &str, caller_id: Uuid) -> Result<(), DomainError> {
+        // External mount: delete on the provider (permanent — mounts have no
+        // trash). The mount root is a real folder row and is not deletable here.
+        match self.mount_router.classify(id) {
+            ResolvedId::Regular => {}
+            ResolvedId::MountRoot { .. } => {
+                return Err(DomainError::operation_not_supported(
+                    "Folder",
+                    "a mount root cannot be deleted through this endpoint",
+                ));
+            }
+            ResolvedId::MountChild { cfg, node_id } => {
+                self.require_mount_perm(&cfg, Permission::Delete, caller_id)
+                    .await?;
+                cfg.provider.delete(&node_id).await?;
+                audit_mount_write("delete", &cfg, caller_id, node_id.as_str());
+                return Ok(());
+            }
+        }
+
         self.authz
             .require(
                 Subject::User(caller_id),
@@ -579,6 +714,15 @@ impl FolderUseCase for FolderService {
             )
         })
     }
+}
+
+/// The error returned when a move would cross a storage backend boundary
+/// (mount ↔ native, or between two different mounts). Forbidden in v1.
+fn cross_boundary_move_err() -> DomainError {
+    DomainError::operation_not_supported(
+        "Folder",
+        "moving between external mounts and regular storage is not supported",
+    )
 }
 
 // ── FolderService — cursor-paginated resource listing ────────────────────────
@@ -1199,6 +1343,227 @@ mod mount_authz_integration {
             Arc::new(FileBlobReadRepository::new_stub()),
             Arc::new(SubjectGroupPgRepository::new(pool.clone())),
         ))
+    }
+
+    /// Provision a mount over `host`, build a wired FolderService, and return
+    /// `(folder_service, mount_root_uuid_string, owner_id)`.
+    async fn wire_mount(
+        pool: &Arc<sqlx::PgPool>,
+        host: &std::path::Path,
+    ) -> (FolderService, String, Uuid) {
+        let p = provision_folder(pool, "owner", "Media").await;
+        insert_mount(pool, &p, host.to_str().unwrap()).await;
+        let registry = Arc::new(MountRegistry::empty());
+        registry
+            .reload(
+                &ExternalMountPgRepository::new(pool.clone()),
+                &DefaultMountProviderFactory::new(),
+            )
+            .await;
+        let router = Arc::new(MountRouter::new(registry));
+        let fs = FolderService::new(
+            Arc::new(FolderDbRepository::new(pool.clone())),
+            acl(pool),
+            router,
+        );
+        (fs, p.mount_folder_id.to_string(), p.owner_id)
+    }
+
+    /// P2 write path: owner can mkdir/rename/delete inside a mount (reflected on
+    /// the host fs); a stranger is denied; the mount root cannot be renamed.
+    #[tokio::test]
+    async fn owner_mkdir_rename_delete_on_mount() {
+        use crate::application::dtos::folder_dto::{CreateFolderDto, RenameFolderDto};
+        let (_c, pool) = fresh_db().await;
+        let host = tempfile::tempdir().unwrap();
+        let (fs, mount_id, owner) = wire_mount(&pool, host.path()).await;
+
+        // mkdir under the mount root.
+        let created = fs
+            .create_folder_with_perms(
+                CreateFolderDto {
+                    name: "docs".into(),
+                    parent_id: Some(mount_id.clone()),
+                },
+                owner,
+            )
+            .await
+            .expect("owner may mkdir");
+        assert!(host.path().join("docs").is_dir());
+        assert!(created.id.starts_with("ext:"));
+        assert_eq!(created.parent_id.as_deref(), Some(mount_id.as_str()));
+
+        // Stranger may NOT mkdir.
+        let stranger = make_user(&pool, "stranger").await;
+        let denied = fs
+            .create_folder_with_perms(
+                CreateFolderDto {
+                    name: "evil".into(),
+                    parent_id: Some(mount_id.clone()),
+                },
+                stranger,
+            )
+            .await;
+        assert!(denied.is_err());
+        assert!(!host.path().join("evil").exists());
+
+        // rename the created dir.
+        let renamed = fs
+            .rename_folder_with_perms(
+                &created.id,
+                RenameFolderDto {
+                    name: "papers".into(),
+                },
+                owner,
+            )
+            .await
+            .expect("owner may rename");
+        assert!(host.path().join("papers").is_dir());
+        assert!(!host.path().join("docs").exists());
+
+        // The mount root itself cannot be renamed through this path.
+        assert!(
+            fs.rename_folder_with_perms(
+                &mount_id,
+                RenameFolderDto {
+                    name: "nope".into()
+                },
+                owner
+            )
+            .await
+            .is_err()
+        );
+
+        // delete (permanent — mounts have no trash).
+        fs.delete_folder_with_perms(&renamed.id, owner)
+            .await
+            .expect("owner may delete");
+        assert!(!host.path().join("papers").exists());
+    }
+
+    /// P2: file rename/delete and streaming upload on a mount, with authz.
+    #[tokio::test]
+    async fn file_rename_delete_and_upload_on_mount() {
+        use crate::application::ports::external_mount_ports::MountByteStream;
+        use crate::application::ports::file_ports::FileManagementUseCase;
+        use crate::application::services::external_upload_service::ExternalUploadService;
+        use crate::application::services::file_management_service::FileManagementService;
+        use crate::infrastructure::repositories::pg::FileBlobWriteRepository;
+        use bytes::Bytes;
+        use futures::stream;
+
+        let (_c, pool) = fresh_db().await;
+        let host = tempfile::tempdir().unwrap();
+        std::fs::write(host.path().join("a.txt"), b"hello").unwrap();
+
+        let p = provision_folder(&pool, "owner", "Media").await;
+        insert_mount(&pool, &p, host.path().to_str().unwrap()).await;
+        let registry = Arc::new(MountRegistry::empty());
+        registry
+            .reload(
+                &ExternalMountPgRepository::new(pool.clone()),
+                &DefaultMountProviderFactory::new(),
+            )
+            .await;
+        let router = Arc::new(MountRouter::new(registry.clone()));
+        let cfg = registry.get(&p.mount_folder_id).expect("registered");
+
+        let mgmt = FileManagementService::with_trash(
+            Arc::new(FileBlobWriteRepository::new_stub()),
+            None,
+            None,
+            None,
+            None,
+            acl(&pool),
+        )
+        .with_mount_router(router.clone());
+
+        let file_id = encode_child_id(p.mount_folder_id, "a.txt");
+
+        // Owner renames the mount file.
+        let renamed = mgmt
+            .rename_file_with_perms(&file_id, p.owner_id, "b.txt")
+            .await
+            .expect("owner may rename");
+        assert!(host.path().join("b.txt").exists());
+        assert!(!host.path().join("a.txt").exists());
+        assert_eq!(renamed.content_hash, "");
+
+        // Stranger may not delete.
+        let stranger = make_user(&pool, "stranger").await;
+        assert!(
+            mgmt.delete_file_with_perms(&renamed.id, stranger)
+                .await
+                .is_err()
+        );
+        assert!(host.path().join("b.txt").exists());
+
+        // Owner deletes (permanent — no trash).
+        mgmt.delete_file_with_perms(&renamed.id, p.owner_id)
+            .await
+            .expect("owner may delete");
+        assert!(!host.path().join("b.txt").exists());
+
+        // Streaming upload straight to the provider.
+        let upload = ExternalUploadService::new(acl(&pool));
+        let body: MountByteStream<'static> =
+            Box::pin(stream::once(async { Ok(Bytes::from_static(b"uploaded")) }));
+        let dto = upload
+            .write_file(&cfg, &NodeId::default(), "new.txt", body, p.owner_id)
+            .await
+            .expect("owner may upload");
+        assert_eq!(dto.size, 8);
+        assert_eq!(
+            std::fs::read(host.path().join("new.txt")).unwrap(),
+            b"uploaded"
+        );
+
+        // Stranger upload denied.
+        let body2: MountByteStream<'static> =
+            Box::pin(stream::once(async { Ok(Bytes::from_static(b"x")) }));
+        assert!(
+            upload
+                .write_file(&cfg, &NodeId::default(), "evil.txt", body2, stranger)
+                .await
+                .is_err()
+        );
+        assert!(!host.path().join("evil.txt").exists());
+    }
+
+    /// P2: a move that would cross the mount boundary is forbidden.
+    #[tokio::test]
+    async fn cross_boundary_move_forbidden() {
+        use crate::application::dtos::folder_dto::{CreateFolderDto, MoveFolderDto};
+        let (_c, pool) = fresh_db().await;
+        let host = tempfile::tempdir().unwrap();
+        std::fs::create_dir(host.path().join("inside")).unwrap();
+        let (fs, mount_id, owner) = wire_mount(&pool, host.path()).await;
+
+        let child_id = encode_child_id(Uuid::parse_str(&mount_id).unwrap(), "inside");
+
+        // Moving a mount child to the user's native root (parent_id = None) is
+        // a cross-backend move → UnsupportedOperation.
+        let err = fs
+            .move_folder_with_perms(&child_id, MoveFolderDto { parent_id: None }, owner)
+            .await
+            .expect_err("cross-boundary move must be forbidden");
+        assert_eq!(
+            err.kind,
+            crate::domain::errors::ErrorKind::UnsupportedOperation
+        );
+
+        // A native folder cannot be moved INTO the mount either.
+        let native = fs
+            .create_folder_with_perms(
+                CreateFolderDto {
+                    name: "n".into(),
+                    parent_id: Some(mount_id.clone()),
+                },
+                owner,
+            )
+            .await;
+        // (n is created inside the mount; that's a normal mkdir, allowed.)
+        assert!(native.is_ok());
     }
 
     /// Full read path: owner can list a mount's live contents; a stranger with

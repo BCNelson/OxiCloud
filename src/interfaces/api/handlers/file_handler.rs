@@ -240,6 +240,35 @@ impl FileHandler {
                     }
                 }
 
+                // ── External mount destination? Stream to the provider ──
+                // Detected BEFORE the CAS ingest so the bytes never touch
+                // BLAKE3/dedup. Authorization happens inside the service.
+                if let Some(ref fid) = folder_id {
+                    let (mount_cfg, parent_node) = match state.mount_router.classify(fid) {
+                        ResolvedId::MountRoot { cfg } => (Some(cfg), NodeId::default()),
+                        ResolvedId::MountChild { cfg, node_id } => (Some(cfg), node_id),
+                        ResolvedId::Regular => (None, NodeId::default()),
+                    };
+                    if let Some(cfg) = mount_cfg {
+                        use futures::StreamExt;
+                        let body: crate::application::ports::external_mount_ports::MountByteStream<
+                            '_,
+                        > = Box::pin(
+                            upload_ingest::multipart_field_stream(field)
+                                .map(|r| r.map_err(|e| std::io::Error::other(e.to_string()))),
+                        );
+                        return match state
+                            .applications
+                            .external_upload_service
+                            .write_file(&cfg, &parent_node, &filename, body, auth_user.id)
+                            .await
+                        {
+                            Ok(file) => Ok((file, String::new())),
+                            Err(err) => Err(Self::domain_error_response(err)),
+                        };
+                    }
+                }
+
                 // ── Stream the field into the CDC chunk store ────────
                 // Chunking (FastCDC) + hashing (BLAKE3) + dedup checks +
                 // MIME sniffing all happen while the bytes arrive; chunks

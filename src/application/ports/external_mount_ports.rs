@@ -32,7 +32,8 @@ use crate::domain::services::external_mount_id::NodeId;
 ///
 /// Boxed (not generic) so the trait stays object-safe. Callers map their body's
 /// error type to `std::io::Error` before constructing it.
-pub type MountByteStream = Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>>;
+pub type MountByteStream<'a> =
+    Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send + 'a>>;
 
 /// One entry returned by [`ExternalMountProvider::list_dir`].
 #[derive(Debug, Clone)]
@@ -126,7 +127,7 @@ pub trait ExternalMountProvider: Send + Sync + 'static {
         &self,
         parent: &NodeId,
         name: &str,
-        body: MountByteStream,
+        body: MountByteStream<'_>,
     ) -> Result<MountStat, DomainError>;
 
     /// Rename an entry in place (same parent). Returns the renamed entry's stat.

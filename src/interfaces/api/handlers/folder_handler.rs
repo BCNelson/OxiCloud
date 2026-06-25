@@ -177,6 +177,22 @@ impl FolderHandler {
         Path(id): Path<String>,
     ) -> impl IntoResponse {
         let user_id = auth_user.id;
+
+        // External mounts have no trash — a permanent provider delete is the
+        // only option. Route `ext:` ids straight to the mount-aware service
+        // delete, skipping the (always-failing) trash attempt.
+        if state.mount_router.is_mount_id(&id) {
+            return match state
+                .applications
+                .folder_service
+                .delete_folder_with_perms(&id, user_id)
+                .await
+            {
+                Ok(_) => StatusCode::NO_CONTENT.into_response(),
+                Err(err) => AppError::from(err).into_response(),
+            };
+        }
+
         // Check if trash service is available
         // FIXME: permissions !!
         if let Some(trash_service) = &state.trash_service {

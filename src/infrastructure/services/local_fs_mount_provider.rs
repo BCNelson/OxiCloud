@@ -333,7 +333,7 @@ impl ExternalMountProvider for LocalFsMountProvider {
         &self,
         parent: &NodeId,
         name: &str,
-        mut body: MountByteStream,
+        mut body: MountByteStream<'_>,
     ) -> Result<MountStat, DomainError> {
         self.ensure_writable()?;
         validate_name(name)?;
@@ -535,7 +535,7 @@ mod tests {
         assert!(d.is_dir);
 
         // write into it
-        let body: MountByteStream =
+        let body: MountByteStream<'static> =
             Box::pin(stream::once(async { Ok(Bytes::from_static(b"data")) }));
         let f = p
             .write_stream(&NodeId("folder".into()), "x.txt", body)
@@ -744,7 +744,7 @@ mod tests {
         let dir = tempdir().unwrap();
         std::fs::write(dir.path().join("f.txt"), b"old-and-longer").unwrap();
         let p = provider(dir.path());
-        let body: MountByteStream =
+        let body: MountByteStream<'static> =
             Box::pin(stream::once(async { Ok(Bytes::from_static(b"new")) }));
         let s = p
             .write_stream(&NodeId("".into()), "f.txt", body)
@@ -762,7 +762,7 @@ mod tests {
         use futures::stream;
         let dir = tempdir().unwrap();
         let p = provider(dir.path());
-        let body: MountByteStream = Box::pin(stream::iter(vec![
+        let body: MountByteStream<'static> = Box::pin(stream::iter(vec![
             Ok(Bytes::from_static(b"foo")),
             Ok(Bytes::from_static(b"bar")),
             Ok(Bytes::from_static(b"baz")),
@@ -783,7 +783,7 @@ mod tests {
         use futures::stream;
         let dir = tempdir().unwrap();
         let p = provider(dir.path());
-        let body: MountByteStream = Box::pin(stream::iter(vec![
+        let body: MountByteStream<'static> = Box::pin(stream::iter(vec![
             Ok(Bytes::from_static(b"partial")),
             Err(std::io::Error::other("boom")),
         ]));
@@ -937,7 +937,7 @@ mod tests {
         use futures::stream;
         let dir = tempdir().unwrap();
         let p = provider(dir.path());
-        let body: MountByteStream = Box::pin(stream::empty());
+        let body: MountByteStream<'static> = Box::pin(stream::empty());
         let s = p
             .write_stream(&NodeId("".into()), "empty.txt", body)
             .await
@@ -1001,7 +1001,8 @@ mod tests {
         std::fs::create_dir(dir.path().join("dest")).unwrap();
         let p = LocalFsMountProvider::new(dir.path(), true).unwrap();
         use futures::stream;
-        let body: MountByteStream = Box::pin(stream::once(async { Ok(Bytes::from_static(b"x")) }));
+        let body: MountByteStream<'static> =
+            Box::pin(stream::once(async { Ok(Bytes::from_static(b"x")) }));
         assert!(
             p.write_stream(&NodeId("".into()), "n.txt", body)
                 .await

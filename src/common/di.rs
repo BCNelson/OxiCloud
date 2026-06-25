@@ -524,7 +524,7 @@ impl AppServiceFactory {
         let folder_service = Arc::new(FolderService::new(
             repos.folder_repository.clone(),
             authz.clone(),
-            mount_router,
+            mount_router.clone(),
         ));
 
         // Built before the upload/management services so the plugin lifecycle
@@ -581,7 +581,15 @@ impl AppServiceFactory {
                 Some(core.file_content_cache.clone()),
                 authz.clone(),
             )
-            .with_file_lifecycle_hook(file_lifecycle.clone()),
+            .with_file_lifecycle_hook(file_lifecycle.clone())
+            .with_mount_router(mount_router.clone()),
+        );
+
+        // Streams uploads to external mount providers (bypasses the CAS).
+        let external_upload_service = Arc::new(
+            crate::application::services::external_upload_service::ExternalUploadService::new(
+                authz.clone(),
+            ),
         );
 
         let file_use_case_factory = Arc::new(AppFileUseCaseFactory::new(
@@ -618,6 +626,7 @@ impl AppServiceFactory {
             delta_upload_service,
             file_retrieval_service,
             file_management_service,
+            external_upload_service,
             file_use_case_factory,
             i18n_service,
             trash_service, // Already set via parameter
@@ -1876,6 +1885,9 @@ pub struct ApplicationServices {
         Arc<crate::application::services::delta_upload_service::DeltaUploadService>,
     pub file_retrieval_service: Arc<FileRetrievalService>,
     pub file_management_service: Arc<FileManagementService>,
+    /// Streams uploads straight to an external mount provider (bypasses the CAS).
+    pub external_upload_service:
+        Arc<crate::application::services::external_upload_service::ExternalUploadService>,
     pub file_use_case_factory: Arc<dyn FileUseCaseFactory>,
     pub i18n_service: Arc<I18nApplicationService>,
     pub trash_service: Option<Arc<TrashService>>,
